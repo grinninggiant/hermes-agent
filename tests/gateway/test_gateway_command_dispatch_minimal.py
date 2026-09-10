@@ -108,12 +108,12 @@ async def test_idle_queue_sends_payload_as_next_turn(command_text):
     runner, _adapter = _make_runner()
     captured = {}
 
-    async def fake_handle_message_with_agent(event, source, key, generation):
+    async def fake_handle_message_with_agent(event, source, key, run_generation):
         captured["text"] = event.text
         captured["command"] = event.get_command()
         captured["source"] = source
         captured["key"] = key
-        captured["generation"] = generation
+        captured["generation"] = run_generation
         return {"final_response": "", "messages": []}
 
     runner._handle_message_with_agent = fake_handle_message_with_agent

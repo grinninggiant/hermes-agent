@@ -26,6 +26,104 @@ def _turn_context(is_current):
     return ctx
 
 
+@pytest.mark.asyncio
+async def test_restart_wait_owns_post_turn_goal_judge_until_handoff_finishes():
+    """A restart must not stop while the post-turn goal judge still owns the turn.
+
+    ``_run_agent`` releases its running-agent slot before the outer inbound handler runs the
+    post-turn hooks.  The barrier makes that ordering deterministic and catches a restart task
+    that observes the released slot while the auxiliary judge is still pending.
+    """
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source()
+    event = SimpleNamespace(source=source, text="finish", internal=False)
+    key = runner._session_key_for_source(source)
+    judge_started = asyncio.Event()
+    allow_judge = asyncio.Event()
+
+    runner._hm_admit_event = AsyncMock(return_value=(event, source, False))
+    runner._hm_estop_gate = MagicMock(return_value=None)
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    runner._hm_evict_idle_stale_agent = MagicMock()
+    runner._hm_evict_reaped_agent = MagicMock()
+    runner._is_session_running = lambda session_key: session_key in runner._running_agents
+    runner._hm_dispatch_idle_commands = AsyncMock(return_value=(False, None))
+    runner._claim_active_session_slot = MagicMock(return_value=(None, None))
+    runner._begin_session_run_generation = MagicMock(return_value=1)
+    runner._restore_moa_one_shot = MagicMock()
+    runner._restore_pending_one_turn_model_override = MagicMock()
+    runner._clear_durable_active_turn = AsyncMock()
+    runner._release_turn_lease = MagicMock()
+
+    async def finished_turn(*_args):
+        # This is the release performed by _run_agent's cleanup before its caller returns.
+        runner._release_running_agent_state(key)
+        runner.request_restart(detached=False, via_service=True)
+        return "reply"
+
+    async def blocked_post_turn(**_kwargs):
+        judge_started.set()
+        await allow_judge.wait()
+
+    runner._handle_message_with_agent = finished_turn
+    runner._run_post_turn_hooks = blocked_post_turn
+    runner.stop = AsyncMock()
+    runner._restart_after_turn_timeout = 1.0
+
+    handling = asyncio.create_task(runner._handle_message(event))
+    await asyncio.wait_for(judge_started.wait(), timeout=1.0)
+    assert runner._active_work_count() == 1
+    await asyncio.sleep(0.15)
+
+    assert runner.stop.await_count == 0
+    allow_judge.set()
+    await handling
+    await runner._restart_task
+    runner.stop.assert_awaited_once_with(
+        restart=True, detached_restart=False, service_restart=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_draining_goal_continuation_is_handed_to_durable_resume_path():
+    """A judged continuation must survive adapter FIFO teardown once drain owns shutdown."""
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm", user_id="user")
+    runner = object.__new__(GatewayRunner)
+    marker = AsyncMock()
+    runner.session_store = MagicMock()
+    runner._async_session_store = SimpleNamespace(_store=runner.session_store, mark_resume_pending=marker)
+    runner._draining = True
+    runner._restart_requested = True
+    runner._session_key_for_source = MagicMock(return_value="telegram:chat")
+    runner._post_turn_manager = AsyncMock(
+        return_value=SimpleNamespace(
+            is_active=lambda: True,
+            evaluate_after_turn=lambda *_args, **_kwargs: {
+                "should_continue": True,
+                "continuation_prompt": "continue",
+                "message": "continuing",
+                "verdict": "continue",
+            },
+        )
+    )
+    runner._run_in_executor_with_context = lambda fn: asyncio.sleep(0, result=fn())
+    runner._defer_goal_status_notice_after_delivery = AsyncMock()
+    runner._enqueue_fifo = MagicMock()
+
+    await GatewayGoalsMixin._post_turn_goal_continuation(
+        runner, session_entry=SimpleNamespace(session_id="session"),
+        source=source, final_response="done",
+    )
+
+    marker.assert_awaited_once_with(
+        "telegram:chat", "goal_continuation",
+        expected_session_id="session", owner_check=None,
+    )
+    runner._enqueue_fifo.assert_not_called()
+
+
 def test_interrupt_publication_timeout_abandons_late_callback(monkeypatch):
     callbacks = []
     ctx = _turn_context(lambda: True)

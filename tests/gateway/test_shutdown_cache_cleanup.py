@@ -12,6 +12,7 @@ The fix adds an explicit sweep of ``_agent_cache`` after
 import asyncio
 import threading
 from collections import OrderedDict
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -50,9 +51,16 @@ class _FakeGateway:
         self._pending_messages = {}
         self._pending_approvals = {}
         self._busy_ack_ts = {}
+        self.session_store = SimpleNamespace(peek_session_id=lambda _key: None)
+        self.async_session_store = SimpleNamespace(
+            mark_resume_pending=lambda *_args, **_kwargs: asyncio.sleep(0, result=True),
+        )
 
     def _running_agent_count(self):
         return len(self._running_agents)
+
+    def _peek_session_state(self, _session_key):
+        return None
 
     def _active_cron_job_count(self):
         # stop() reads this alongside _running_agent_count when logging the
