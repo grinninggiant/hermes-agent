@@ -1264,6 +1264,31 @@ class SessionDB(
         else:
             self._write_sql(sql, (key, value))
 
+    def set_meta_if_equals(
+        self, key: str, expected: str, value: str, *, condition: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        """Set ``state_meta[key]`` only when its current value is exactly *expected*.
+
+        The optional condition runs after ``BEGIN IMMEDIATE`` acquires the write lock and before
+        the compare-and-set. Exceptions fail closed. Callers use this for ownership checks that
+        must not be split across an LLM or other await.
+        """
+        def _do(conn):
+            if condition is not None:
+                try:
+                    if not condition():
+                        return False
+                except Exception:
+                    return False
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+            if row is None or row[0] != expected:
+                return False
+            return conn.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
+                (value, key, expected),
+            ).rowcount == 1
+        return bool(self._execute_write(_do))
+
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban`` by cwd under the board's workspaces
         root; gated once per root via state_meta. Returns rows retagged."""

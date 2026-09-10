@@ -1506,13 +1506,73 @@ class TurnRunner:
                 entry = self._runner.session_store._entries.get(ctx.session_key)
         resume_pending = entry is not None and getattr(entry, "resume_pending", False)
         resume_reason = (getattr(entry, "resume_reason", None) or "restart_timeout") if resume_pending else None
+        goal_recovery = bool(
+            getattr(getattr(ctx, "gateway_event", None), "_gateway_goal_continuation_recovery", False)
+        )
         # resume_pending freshness ALSO uses the restart watchdog's ``last_resume_marked_at`` (the true
         # interruption stamp): the transcript clock can be hours older for an active thread, and the
         # startup auto-resume turn has empty text, so gating on it alone yields a blank user message.
         mark_is_fresh = resume_pending and _is_fresh_gateway_interruption(
             getattr(entry, "last_resume_marked_at", None), window_secs=window,
         )
-        if resume_pending and (interruption_is_fresh or mark_is_fresh):
+        if goal_recovery:
+            # A delivery-ledger claim may have cleared resume_pending after the goal judge already
+            # persisted CONTINUE. Rebuild the native goal prompt from durable contract state, so
+            # recovery executes the judged continuation instead of asking an interactive user what
+            # to do next. Recheck the state at turn start to fence a late completion. Recovery is
+            # fail-closed: an invalid marker must never become an empty interactive model turn.
+            recovery_reason = None
+            try:
+                from hermes_cli.goals import (
+                    CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE, GoalManager,
+                )
+                manager = GoalManager(entry.session_id) if entry is not None else None
+                goal = manager.state if manager is not None else None
+                parked = goal is not None and any(
+                    getattr(goal, field, None)
+                    for field in (
+                        "waiting_on_pid", "waiting_on_session", "waiting_until", "waiting_on_delegations",
+                    )
+                )
+                retryable_gate = next(
+                    (
+                        gate for gate in (getattr(goal, "gates", None) or [])
+                        if getattr(gate, "last_exit_code", None) not in (None, 0)
+                        and getattr(gate, "attempts", 0) <= getattr(gate, "max_retries", 0)
+                    ),
+                    None,
+                )
+                if goal is None or goal.status != "active" or (
+                    goal.last_verdict != "continue" and retryable_gate is None
+                ):
+                    recovery_reason = "goal_missing_or_inactive"
+                elif parked:
+                    recovery_reason = "goal_continuation_parked"
+                else:
+                    if retryable_gate is not None:
+                        # Gate evidence is already durable; derive the repair prompt from it rather
+                        # than persisting a second piece of recovery prose.
+                        prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
+                            goal=goal.goal,
+                            command=retryable_gate.command,
+                            exit_code=retryable_gate.last_exit_code,
+                            attempt=retryable_gate.attempts,
+                            max_retries=retryable_gate.max_retries,
+                            output=retryable_gate.last_output_tail or "(no output)",
+                        )
+                    else:
+                        prompt = manager.next_continuation_prompt()
+                    if not isinstance(prompt, str) or not prompt.strip():
+                        recovery_reason = "goal_continuation_prompt_missing"
+                    else:
+                        ctx.message = prompt
+                        persist_override = prompt
+            except Exception:
+                logger.warning("Goal continuation recovery state could not be loaded", exc_info=True)
+                recovery_reason = "goal_continuation_recovery_load_failed"
+            if recovery_reason:
+                ctx._goal_recovery_abort_reason = recovery_reason
+        elif resume_pending and (interruption_is_fresh or mark_is_fresh):
             # Empty message = the startup auto-resume turn; there is no NEW user message.
             ctx.message, persist_override = _prepare_resume_pending_message(
                 resume_reason, ctx.message, interactive=self._resume_note_interactive(),
@@ -1533,6 +1593,22 @@ class TurnRunner:
         if isinstance(ctx.message, str) and not ctx.message.strip() and resume_pending:
             ctx.message = build_resume_recovery_note(resume_reason, "", interactive=self._resume_note_interactive())
         return persist_override, ctx.persist_user_timestamp
+
+    def _goal_recovery_abort_result(self, agent_history, reason: str) -> Dict[str, Any]:
+        """Return a terminal result for an invalid native goal-recovery marker."""
+        return {
+            "final_response": "⚠️ Goal continuation recovery was aborted safely.",
+            "messages": [],
+            "api_calls": 0,
+            "tools": [],
+            "history_offset": len(agent_history),
+            "session_id": self._ctx.session_id,
+            "completed": False,
+            "failed": True,
+            "failure_reason": reason,
+            "turn_exit_reason": "goal_continuation_recovery_invalid",
+            "interrupted": False,
+        }
 
     def _native_image_run_message(self):
         """Wrap the user turn as an OpenAI-style multimodal content list when
@@ -1815,6 +1891,9 @@ class TurnRunner:
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         if not ctx._run_still_current():
             return self._stale_run_result()
+        recovery_abort_reason = getattr(ctx, "_goal_recovery_abort_reason", None)
+        if recovery_abort_reason:
+            return self._goal_recovery_abort_result(agent_history, recovery_abort_reason)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor

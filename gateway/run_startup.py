@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import faulthandler
+import inspect
 import logging
 import os
 import signal
@@ -235,15 +236,42 @@ class GatewayStartupMixin:
         runtime reconnect recovery (``require_success``) is stricter: if the session-store write
         fails the response must not be sent, or the turn could be resumed too."""
         sendable = []
+        from gateway.run import _GOAL_CONTINUATION_RESUME_REASON
         for row in claimed:
             session_key = row.get("session_key") or ""
             if not session_key:
                 sendable.append(row)
                 continue
             try:
-                await self.async_session_store.clear_resume_pending(session_key)
+                lookup = getattr(self.async_session_store, "lookup_by_session_key", None)
+                if not inspect.iscoroutinefunction(lookup):
+                    # Lightweight delivery-only test doubles and legacy callers do not expose the
+                    # async inspection seam; retain their established ordinary-marker behavior.
+                    await self.async_session_store.clear_resume_pending(session_key)
+                    sendable.append(row)
+                    continue
+                clear_for_delivery = getattr(
+                    self.async_session_store, "clear_resume_pending_for_delivery", None,
+                )
+                if inspect.iscoroutinefunction(clear_for_delivery):
+                    # The reason check and clear must be one store-lock operation: a goal judge may
+                    # install its continuation after the ledger claim but before this await returns.
+                    await clear_for_delivery(
+                        session_key, preserve_reason=_GOAL_CONTINUATION_RESUME_REASON,
+                    )
+                else:
+                    # Legacy stores do not expose the atomic predicate; retain their old behavior.
+                    entry = await lookup(session_key)
+                    if getattr(entry, "resume_reason", None) != _GOAL_CONTINUATION_RESUME_REASON:
+                        await self.async_session_store.clear_resume_pending(session_key)
             except Exception:
-                logger.debug("clear_resume_pending failed for %s", session_key, exc_info=True)
+                # Do not silently erase a possibly distinct continuation obligation when the
+                # durable session state cannot be inspected.  The delivery row remains recoverable;
+                # visible warning plus retry on a later startup is safer than dropping next work.
+                logger.warning(
+                    "Could not inspect resume obligation for claimed delivery %s; preserving marker",
+                    session_key, exc_info=True,
+                )
                 if require_success:
                     continue
             sendable.append(row)
@@ -463,17 +491,35 @@ class GatewayStartupMixin:
     def _resume_pending_candidates(self, platform=None) -> Optional[list]:
         """Snapshot resume-pending entries (optionally scoped to ``platform``); None when
         enumeration failed or the restart-loop breaker tripped for this boot."""
+        from gateway.run import _GOAL_CONTINUATION_RESUME_REASON
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
-                candidates = [
-                    entry for entry in self.session_store._entries.values()  # noqa: SLF001
-                    if entry.resume_pending
-                    and not entry.suspended
-                    and entry.origin is not None
-                    and entry.resume_reason in self._AUTO_RESUME_REASONS
-                    and (platform is None or entry.origin.platform == platform)
-                ]
+                entries = list(self.session_store._entries.values())  # noqa: SLF001
+            candidates = []
+            for entry in entries:
+                if entry.suspended or entry.origin is None:
+                    continue
+                if platform is not None and entry.origin.platform != platform:
+                    continue
+                goal_pending = (
+                    entry.resume_reason == _GOAL_CONTINUATION_RESUME_REASON
+                    and self._goal_continuation_pending_for_entry(entry)
+                )
+                if entry.resume_pending:
+                    if entry.resume_reason not in self._AUTO_RESUME_REASONS:
+                        continue
+                    if (
+                        entry.resume_reason == _GOAL_CONTINUATION_RESUME_REASON
+                        and not goal_pending
+                    ):
+                        continue
+                else:
+                    # A native CONTINUE verdict is not itself an unconsumed delivery.  Only the
+                    # existing durable resume marker, claimed by the shutdown/ownership path,
+                    # authorizes a restart turn; otherwise a consumed or parked wait would replay.
+                    continue
+                candidates.append(entry)
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return None
@@ -509,7 +555,10 @@ class GatewayStartupMixin:
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
         sessions with a running agent are skipped so none is resumed twice."""
-        from gateway.run import _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window
+        from gateway.run import (
+            _AGENT_PENDING_SENTINEL, _GOAL_CONTINUATION_RESUME_REASON,
+            _auto_continue_freshness_window,
+        )
         window = _auto_continue_freshness_window()
         candidates = self._resume_pending_candidates(platform)
         if candidates is None:
@@ -517,7 +566,15 @@ class GatewayStartupMixin:
         now = datetime.now()
         scheduled = 0
         for entry in candidates:
+            goal_pending = (
+                entry.resume_reason == _GOAL_CONTINUATION_RESUME_REASON
+                and self._goal_continuation_pending_for_entry(entry)
+            )
             marker = entry.last_resume_marked_at or entry.updated_at
+            if goal_pending:
+                goal_marker = self._goal_last_turn_marker_for_entry(entry)
+                if goal_marker is not None:
+                    marker = max(marker or datetime.min, goal_marker)
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
             # Already being resumed (e.g. scheduled at startup, still in-flight) — no second turn.
@@ -541,6 +598,7 @@ class GatewayStartupMixin:
             self._persist_active_agents()
             # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
             event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+            event._gateway_goal_continuation_recovery = goal_pending
             task = self._retain_background_task(
                 asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
             )
@@ -553,6 +611,29 @@ class GatewayStartupMixin:
         if scheduled:
             logger.info("Scheduled auto-resume for %d restart-interrupted session(s)", scheduled)
         return scheduled
+
+    def _goal_last_turn_marker_for_entry(self, entry) -> Optional[datetime]:
+        """Read goal freshness from the routing entry's owning profile, never ambient HOME."""
+        session_id = getattr(entry, "session_id", None)
+        origin = getattr(entry, "origin", None)
+        if not session_id or origin is None:
+            return None
+        try:
+            profile_home = self._resolve_profile_home_for_source(origin)
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+            from hermes_cli.goals import load_goal
+            token = set_hermes_home_override(str(profile_home))
+            try:
+                state = load_goal(session_id)
+            finally:
+                reset_hermes_home_override(token)
+            last_turn_at = getattr(state, "last_turn_at", None) if state is not None else None
+            return datetime.fromtimestamp(last_turn_at) if last_turn_at else None
+        except (TypeError, ValueError, OSError):
+            return None
+        except Exception:
+            logger.debug("Failed to load goal freshness for %s", session_id, exc_info=True)
+            return None
 
     def _startup_should_abort(self) -> bool:
         return self._restart_requested or self._draining or self._shutdown_event.is_set()

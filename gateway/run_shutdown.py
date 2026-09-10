@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import json
 import logging
 import os
@@ -29,6 +30,18 @@ from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_wa
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+def _supports_keyword(callable_obj, name: str) -> bool:
+    """Keep older SessionStore/test doubles on the pre-CAS call shape."""
+    try:
+        parameters = inspect.signature(callable_obj).parameters.values()
+        return any(
+            parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _exit_with_failure_verdict(runner) -> bool:
@@ -168,7 +181,59 @@ class GatewayShutdownMixin:
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + self._active_post_turn_work_count()
         )
+
+    def _active_post_turn_work_count(self) -> int:
+        """Post-turn owners whose agent slot has already been released but whose handoff is live.
+
+        The goal judge runs after ``_run_agent`` cleanup releases ``_running_agents``. Keep that
+        work visible to restart draining until the outer inbound handler has completed its hooks.
+        """
+        owners = getattr(self, "_post_turn_work_owners", None)
+        if not isinstance(owners, dict):
+            return 0
+        running = set(getattr(self, "_running_agents", {}) or {})
+        count = 0
+        for value in owners.values():
+            if len(value) == 3:
+                _owner, session_key, generation = value
+            else:  # compatibility with bare test doubles from before generation ownership
+                _owner, session_key = value
+                generation = None
+            # Suppress the owner only while the same generation's agent slot is active. An older
+            # cleanup remains live work after a newer generation takes over the routing key.
+            if session_key not in running or (
+                generation is not None
+                and not self._is_session_run_current(session_key, generation)
+            ):
+                count += 1
+        return count
+
+    def _claim_post_turn_work(self, session_key: str, run_generation: int) -> object:
+        """Claim one post-turn handoff; the returned opaque owner is released exactly once."""
+        owners = getattr(self, "_post_turn_work_owners", None)
+        if not isinstance(owners, dict):
+            owners = self._post_turn_work_owners = {}
+        owner = object()
+        owners[id(owner)] = (owner, session_key, run_generation)
+        try:
+            self._persist_active_agents()
+        except BaseException:
+            owners.pop(id(owner), None)
+            raise
+        return owner
+
+    def _release_post_turn_work(self, owner: object) -> bool:
+        """Release only the caller's post-turn handoff owner."""
+        owners = getattr(self, "_post_turn_work_owners", None)
+        if not isinstance(owners, dict) or owners.pop(id(owner), None) is None:
+            return False
+        try:
+            self._persist_active_agents()
+        except Exception:
+            logger.debug("Failed to persist post-turn owner release", exc_info=True)
+        return True
 
     @staticmethod
     def _running_cron_job_count() -> int:
@@ -709,10 +774,11 @@ class GatewayShutdownMixin:
 
     # Drain / interrupt
     def _drain_work_counts(self) -> tuple:
-        """``(agents, cron, api, deferred)`` — the four sources the drain waits on."""
+        """``(agents, cron, api, deferred, post_turn)`` — work sources the drain waits on."""
         return (
             self._running_agent_count(), self._active_cron_job_count(),
             self._active_api_run_count(), self._active_deferred_agent_worker_count(),
+            self._active_post_turn_work_count(),
         )
 
     async def _drain_active_agents(
@@ -731,10 +797,11 @@ class GatewayShutdownMixin:
                 self._update_runtime_status("draining")
                 last_counts, last_status_at = counts, now
 
-        # Cron/API/deferred work lives outside ``_running_agents``; fold it in or it is killed unwarned.
-        _cron0, _api0, _deferred0 = last_counts[1:]
+        # Cron/API/deferred/post-turn work lives outside ``_running_agents``; fold it in or it is
+        # killed unwarned.
+        _cron0, _api0, _deferred0, _post_turn0 = last_counts[1:]
         _maybe_update_status(force=True)
-        if not self._running_agents and not (_cron0 or _api0 or _deferred0):
+        if not self._running_agents and not (_cron0 or _api0 or _deferred0 or _post_turn0):
             return snapshot, False
         # Cron has its own deadline: a chat turn is announced+resumable; a killed cron run is a permanent failure.
         # ``timeout`` (``restart_drain_timeout``) defaults to 0 because interrupting a chat turn is
@@ -748,8 +815,11 @@ class GatewayShutdownMixin:
 
         def _still_draining() -> bool:
             now = loop.time()
-            agents, cron, api, deferred = self._drain_work_counts()
-            return bool(((agents or api or deferred) and now < deadline) or (cron and now < cron_deadline))
+            agents, cron, api, deferred, post_turn = self._drain_work_counts()
+            return bool(
+                ((agents or api or deferred or post_turn) and now < deadline)
+                or (cron and now < cron_deadline)
+            )
 
         # Both budgets at 0 = an expired deadline (loop unentered), so timed_out still comes from real state.
         while _still_draining():
@@ -780,7 +850,9 @@ class GatewayShutdownMixin:
         from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
         return _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
 
-    async def _mark_running_sessions_resume_pending(self, log_prefix: str) -> list:
+    async def _mark_running_sessions_resume_pending(
+        self, log_prefix: str, *, include_post_turn: bool = False,
+    ) -> list:
         """Mark every non-pending running session resume_pending; returns the keys marked."""
         from gateway.run import _AGENT_PENDING_SENTINEL
         reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
@@ -791,10 +863,114 @@ class GatewayShutdownMixin:
         for _sk, _agent in list(self._running_agents.items()):
             if _agent is _AGENT_PENDING_SENTINEL:
                 continue
+            expected_session_id = getattr(_agent, "session_id", None)
+            if expected_session_id is None:
+                with _log_suppressed(logging.DEBUG, "%s session lookup failed for %s", log_prefix, _sk):
+                    expected_session_id = self.session_store.peek_session_id(_sk)
+            state = self._peek_session_state(_sk)
+            generation = getattr(getattr(state, "persistent", None), "run_generation", None)
+            owner_check = (
+                (lambda: self._is_session_run_current(_sk, generation))
+                if generation is not None else None
+            )
             with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
-                await self.async_session_store.mark_resume_pending(_sk, reason)
-                marked.append(_sk)
+                marker = self.async_session_store.mark_resume_pending
+                if _supports_keyword(marker, "expected_session_id"):
+                    kwargs = {"expected_session_id": expected_session_id}
+                    if _supports_keyword(marker, "owner_check"):
+                        kwargs["owner_check"] = owner_check
+                    changed = await marker(_sk, reason, **kwargs)
+                else:
+                    changed = await marker(_sk, reason)
+                if changed:
+                    marked.append(_sk)
+        if include_post_turn:
+            for value in list((getattr(self, "_post_turn_work_owners", None) or {}).values()):
+                _owner, _sk = value[:2]
+                if not _sk or _sk in marked:
+                    continue
+                generation = value[2] if len(value) >= 3 else None
+                if generation is not None and not self._is_session_run_current(_sk, generation):
+                    continue
+                expected_session_id = None
+                with _log_suppressed(logging.DEBUG, "%s session lookup failed for %s", log_prefix, _sk):
+                    expected_session_id = self.session_store.peek_session_id(_sk)
+                owner_check = (
+                    (lambda: self._is_session_run_current(_sk, generation))
+                    if generation is not None else None
+                )
+                with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
+                    marker = self.async_session_store.mark_resume_pending
+                    if _supports_keyword(marker, "expected_session_id"):
+                        kwargs = {"expected_session_id": expected_session_id}
+                        if _supports_keyword(marker, "owner_check"):
+                            kwargs["owner_check"] = owner_check
+                        changed = await marker(_sk, reason, **kwargs)
+                    else:
+                        changed = await marker(_sk, reason)
+                    if changed:
+                        marked.append(_sk)
         return marked
+
+    def _goal_continuation_pending(self, session_id: str) -> bool:
+        """Whether native goal state selects a live continuation for a recovery marker.
+
+        ``last_verdict`` selects the native prompt, but is not by itself an unconsumed delivery
+        obligation. Startup admission requires the existing durable resume marker separately; the
+        continuation prompt remains derived from the goal contract.
+        """
+        try:
+            from hermes_cli.goals import load_goal
+            state = load_goal(session_id)
+            gate_pending = bool(
+                state and state.status == "active"
+                and any(
+                    getattr(gate, "last_exit_code", None) not in (None, 0)
+                    and getattr(gate, "attempts", 0) <= getattr(gate, "max_retries", 0)
+                    for gate in (getattr(state, "gates", None) or [])
+                )
+            )
+            return bool(
+                state and state.status == "active"
+                and (state.last_verdict == "continue" or gate_pending)
+                and not (
+                    state.waiting_on_pid
+                    or state.waiting_on_session
+                    or state.waiting_until
+                    or state.waiting_on_delegations
+                )
+            )
+        except Exception:
+            logger.debug("Failed to inspect goal continuation state for %s", session_id, exc_info=True)
+            return False
+
+    def _goal_continuation_pending_for_entry(self, entry) -> bool:
+        """Inspect native goal state under the routing entry's owning profile home."""
+        session_id = getattr(entry, "session_id", None)
+        if not session_id:
+            return False
+        origin = getattr(entry, "origin", None)
+        try:
+            profile_home = self._resolve_profile_home_for_source(origin) if origin is not None else None
+        except Exception:
+            profile_home = None
+        if profile_home is None:
+            return self._goal_continuation_pending(session_id)
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            return self._goal_continuation_pending(session_id)
+        finally:
+            reset_hermes_home_override(token)
+
+    def _goal_continuation_pending_for_key(self, session_key: str) -> bool:
+        """Resolve a routing key at the gateway boundary before checking native goal state."""
+        try:
+            entry = self.session_store.lookup_by_session_key(session_key)
+        except Exception:
+            logger.debug("Failed to resolve goal session id for %s", session_key, exc_info=True)
+            return False
+        return self._goal_continuation_pending_for_entry(entry) if entry is not None else False
 
     def _restart_notification_allowed(self, platform: Platform) -> bool:
         """False when the platform config sets ``gateway_restart_notification=false``."""
@@ -1613,7 +1789,10 @@ class GatewayShutdownMixin:
         for _sk in _pre_drain_keys:
             if _sk not in self._running_agents:
                 try:
-                    await self.async_session_store.clear_resume_pending(_sk)
+                    # Preserve a goal continuation installed after the pre-drain snapshot. The
+                    # reason check and clear are atomic in SessionStore; a caller-side inspection
+                    # races the post-turn judge.
+                    await self.async_session_store.clear_resume_pending_for_delivery(_sk)
                 except Exception as _e:
                     logger.debug("clear_resume_pending after drain failed for %s: %s", _sk, _e)
 
@@ -1628,7 +1807,9 @@ class GatewayShutdownMixin:
         )
         # Mark resume_pending BEFORE interrupting so the next message auto-resumes (stuck sessions
         # still escalate via .restart_failure_counts). CURRENT _running_agents, not the drain snapshot.
-        await GatewayRunner._mark_running_sessions_resume_pending(self, "mark_resume_pending")
+        await GatewayRunner._mark_running_sessions_resume_pending(
+            self, "mark_resume_pending", include_post_turn=True,
+        )
         reason = GatewayRunner._shutdown_interrupt_reason(self)
         self._interrupt_running_agents(reason)
         interrupt_grace_timeout = GatewayRunner._post_interrupt_grace_timeout(self)
@@ -1637,7 +1818,10 @@ class GatewayShutdownMixin:
         logger.info("Shutdown phase: allowing %.1fs for interrupted agents to unwind", interrupt_grace_timeout)
 
         def _work_live() -> bool:
-            return bool(self._running_agents or self._active_api_run_count() or ctx.deferred_count())
+            return bool(
+                self._running_agents or self._active_api_run_count() or ctx.deferred_count()
+                or self._active_post_turn_work_count()
+            )
 
         # Wait on API-server work too, or an API turn's tool subprocesses are killed before it unwinds.
         while _work_live() and loop.time() < interrupt_deadline:

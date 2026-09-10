@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
+import inspect
 import logging
 import time
 from contextlib import suppress
@@ -26,6 +27,17 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+def _supports_keyword(callable_obj, name: str) -> bool:
+    try:
+        parameters = inspect.signature(callable_obj).parameters.values()
+        return any(
+            parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -312,10 +324,13 @@ class GatewayGoalsMixin:
         *,
         status: Optional[str] = None,
         kind: GoalStatusNoticeKind = GoalStatusNoticeKind.GOAL,
+        owner_check=None,
     ) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
         adapter = self._goal_notice_adapter(source)
         if not adapter:
+            return
+        if owner_check is not None and not owner_check():
             return
         notice = GoalStatusNotice(kind=kind, status=status, text=message)
         policy = getattr(adapter, "prepare_goal_status_notice", None)
@@ -325,6 +340,8 @@ class GatewayGoalsMixin:
             except Exception as exc:
                 logger.warning("goal continuation: notice policy failed closed: %s", exc, exc_info=True)
                 return
+            if owner_check is not None and not owner_check():
+                return
             if notice is None:
                 return
             if not isinstance(notice, GoalStatusNotice):
@@ -333,6 +350,8 @@ class GatewayGoalsMixin:
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
+        if owner_check is not None and not owner_check():
+            return
         result = await adapter.send(source.chat_id, notice.text, metadata=metadata)
         if result is not None and not getattr(result, "success", True):
             logger.warning(
@@ -346,6 +365,7 @@ class GatewayGoalsMixin:
         *,
         status: Optional[str] = None,
         kind: GoalStatusNoticeKind = GoalStatusNoticeKind.GOAL,
+        owner_check=None,
     ) -> None:
         """Send a /goal status line after the main response is delivered.
 
@@ -358,8 +378,10 @@ class GatewayGoalsMixin:
 
         async def _deliver() -> None:
             try:
+                if owner_check is not None and not owner_check():
+                    return
                 await self._send_goal_status_notice(
-                    source, message, status=status, kind=kind,
+                    source, message, status=status, kind=kind, owner_check=owner_check,
                 )
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
@@ -369,6 +391,8 @@ class GatewayGoalsMixin:
             session_key = self._session_key_for_source(source)
         if session_key and hasattr(adapter, "register_post_delivery_callback"):
             try:
+                if owner_check is not None and not owner_check():
+                    return
                 active = getattr(adapter, "_active_sessions", {}).get(session_key)
                 generation = getattr(active, "_hermes_run_generation", None) if active is not None else None
                 adapter.register_post_delivery_callback(session_key, _deliver, generation=generation)
@@ -402,8 +426,28 @@ class GatewayGoalsMixin:
             max_turns = self._goal_max_turns_from_config()
             return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns)
 
+        # Capture ownership before any async session/DB warm-up.  Looking it up after that await
+        # would let /stop or /new make an old completion appear current under the replacement run.
+        owner_check = None
+        session_key = None
+        with suppress(Exception):
+            session_key = self._session_key_for_source(source)
+        active = getattr(self._adapter_for_source(source), "_active_sessions", {}).get(session_key) if session_key else None
+        generation = getattr(active, "_hermes_run_generation", None) if active is not None else None
+        is_current = getattr(self, "_is_session_run_current", None)
+        if session_key and generation is not None and callable(is_current):
+            captured_session_id = getattr(session_entry, "session_id", None)
+            owner_check = lambda: (
+                is_current(session_key, generation)
+                and getattr(session_entry, "session_id", None) == captured_session_id
+            )
+            if not owner_check():
+                return
+
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
         if mgr is None or not mgr.is_active():
+            return
+        if owner_check is not None and not owner_check():
             return
 
         _bg_procs, _active_deleg = None, 0
@@ -421,8 +465,11 @@ class GatewayGoalsMixin:
             lambda: mgr.evaluate_after_turn(
                 final_response or "", user_initiated=True, background_processes=_bg_procs,
                 active_delegations=_active_deleg,
+                owner_check=owner_check,
             ),
         )
+        if decision.get("stale_owner") or (owner_check is not None and not owner_check()):
+            return
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
         if msg and source is not None:
@@ -434,15 +481,38 @@ class GatewayGoalsMixin:
             )
             await self._defer_goal_status_notice_after_delivery(
                 source, msg, status=notice_status,
+                owner_check=owner_check,
             )
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
+            return
+        if self._draining:
+            # Shutdown discards adapter FIFO entries. Preserve the goal's next turn through the
+            # existing restart recovery path instead of creating an in-memory continuation with no
+            # owner after the adapter is torn down.
+            from gateway.run import _GOAL_CONTINUATION_RESUME_REASON
+            if owner_check is not None and not owner_check():
+                return
+            try:
+                marker = self.async_session_store.mark_resume_pending
+                kwargs = {}
+                if _supports_keyword(marker, "expected_session_id"):
+                    kwargs["expected_session_id"] = getattr(session_entry, "session_id", None)
+                if _supports_keyword(marker, "owner_check"):
+                    kwargs["owner_check"] = owner_check
+                marked = await marker(
+                    self._session_key_for_source(source), _GOAL_CONTINUATION_RESUME_REASON, **kwargs,
+                )
+                if not marked:
+                    logger.warning("goal continuation handoff did not mark session resumable")
+            except Exception:
+                logger.warning("goal continuation handoff failed to persist resume marker", exc_info=True)
             return
         # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
         try:
             adapter = self._adapter_for_source(source)
             _quick_key = self._session_key_for_source(source)
-            if adapter and _quick_key:
+            if adapter and _quick_key and (owner_check is None or owner_check()):
                 self._enqueue_fifo(
                     _quick_key, self._synthetic_prompt_event(source, prompt, internal=True), adapter,
                 )

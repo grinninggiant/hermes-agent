@@ -194,15 +194,27 @@ class SessionLifecycleMixin:
             return True
         return self._update_all_entries_locked(_discard)
 
-    def mark_resume_pending(self, session_key: str, reason: str = "restart_timeout") -> bool:
+    def mark_resume_pending(
+        self, session_key: str, reason: str = "restart_timeout", *,
+        expected_session_id: Optional[str] = None, owner_check=None,
+    ) -> bool:
         """Mark a session resumable after a restart interruption (keeps the session_id/transcript,
         unlike ``suspend_session``). True if marked."""
         def _apply(entry: SessionEntry):
+            if expected_session_id is not None and entry.session_id != expected_session_id:
+                return False
+            if owner_check is not None and not owner_check():
+                return False
             if entry.suspended:  # never override an explicit ``suspended`` (hard forced-wipe)
                 return False
+            # A judged continuation is a stronger obligation than a generic timeout marker. The
+            # post-turn judge can persist it while shutdown is marking the same session.
+            if entry.resume_pending and entry.resume_reason == "goal_continuation":
+                return True
             entry.resume_pending = True
             entry.resume_reason = reason
             entry.last_resume_marked_at = _now()
+            return True
         return self._update_entry(session_key, _apply)
 
     def clear_resume_pending(self, session_key: str) -> bool:
@@ -213,6 +225,23 @@ class SessionLifecycleMixin:
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
+        return self._update_entry(session_key, _apply)
+
+    def clear_resume_pending_for_delivery(
+        self, session_key: str, *, preserve_reason: str = "goal_continuation",
+    ) -> bool:
+        """Clear a delivery marker unless a stronger obligation was installed meanwhile.
+
+        The reason check and clear are one store-lock transaction.  A caller must not inspect the
+        entry, await ledger work, and then clear it: a goal judge can mark the same key in that gap.
+        """
+        def _apply(entry: SessionEntry):
+            if not entry.resume_pending or entry.resume_reason == preserve_reason:
+                return False
+            entry.resume_pending = False
+            entry.resume_reason = None
+            entry.last_resume_marked_at = None
+            return True
         return self._update_entry(session_key, _apply)
 
     def prune_old_entries(self, max_age_days: int) -> int:

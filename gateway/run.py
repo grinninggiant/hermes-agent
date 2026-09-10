@@ -889,6 +889,11 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
 # task after a restart. 1h covers agent.gateway_timeout (30 min) + slack; cfg agent.gateway_auto_continue_freshness.
 _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
 
+# A judged native goal continuation is a distinct durable obligation from an answer that still
+# needs delivery.  Delivery recovery may clear ordinary interruption markers, but must leave this
+# exact reason intact until startup admits the next goal turn.
+_GOAL_CONTINUATION_RESUME_REASON = "goal_continuation"
+
 # Boot auto-resume drain before the inbound gate opens. Override: agent.gateway_startup_restore_drain_timeout.
 _STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT = 30.0
 
@@ -3924,7 +3929,10 @@ class GatewayRunner(
 
     # Reasons set by _stop_impl() on force-interrupt; "restart_interrupted" by suspend_recently_active()
     # on crash recovery (no .clean_shutdown marker). All mean "killed mid-turn" -> startup auto-resume.
-    _AUTO_RESUME_REASONS = frozenset({"restart_timeout", "shutdown_timeout", "restart_interrupted"})
+    _AUTO_RESUME_REASONS = frozenset({
+        "restart_timeout", "shutdown_timeout", "restart_interrupted",
+        _GOAL_CONTINUATION_RESUME_REASON,
+    })
 
     _MAX_SUPERVISED_RESTARTS = 5
     # Ran this long before crashing = HEALTHY (isolated crash, not a crash-loop); restart counter resets.
