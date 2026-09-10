@@ -848,14 +848,14 @@ class TurnRunner:
             scfg = StreamingConfig()
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
+        adapter = self._runner._adapter_for_source(ctx.source)
         want_stream_deltas = (
             scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
-        )
+        ) and bool(adapter is not None and getattr(adapter, "supports_response_streaming", True))
         want_interim_messages = ctx.interim_assistant_messages_enabled
         if want_stream_deltas or want_interim_messages:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
-                adapter = self._runner._adapter_for_source(ctx.source)
                 if adapter:
                     consumer_cfg, pause_typing_before_finalize = self._runner._build_stream_consumer_config(
                         ctx.source, scfg, adapter, on_missing_cursor="raise",
@@ -1200,6 +1200,48 @@ class TurnRunner:
         agent._gateway_turn_process_task_id, agent._gateway_turn_process_baseline = ctx.process_task_id, ctx.process_baseline
         ctx.tools_holder[0] = getattr(agent, "tools", None)  # transcript logging
 
+    def _publish_agent_for_interrupt(self, agent) -> bool:
+        """Publish the native interrupt handle before the worker can enter model work.
+
+        The session state is owned by the gateway loop. A worker-thread write to the context
+        holder followed by a polling promotion leaves a window where ``/stop`` can invalidate this
+        generation without having an agent to interrupt. Rendezvous with the loop so generation
+        validation and publication are one loop-owned operation.
+        """
+        ctx = self._ctx
+        if not ctx.session_key:
+            ctx.agent_holder[0] = agent
+            return ctx._run_still_current()
+
+        loop = ctx._voice_ack_loop
+        if loop is None or not loop.is_running():
+            # Direct TurnRunner tests and non-async callers have no gateway loop. The production
+            # executor path always has one; retain the synchronous seam for those callers.
+            if not ctx._run_still_current():
+                return False
+            ctx.agent_holder[0] = agent
+            self._runner._session_state(ctx.session_key).turn.agent = agent
+            return ctx._run_still_current()
+
+        published = threading.Event()
+        abandoned = threading.Event()
+        accepted = [False]
+
+        def _publish() -> None:
+            try:
+                if not abandoned.is_set() and ctx._run_still_current():
+                    ctx.agent_holder[0] = agent
+                    self._runner._session_state(ctx.session_key).turn.agent = agent
+                    accepted[0] = True
+            finally:
+                published.set()
+
+        loop.call_soon_threadsafe(_publish)
+        if not published.wait(timeout=10):
+            abandoned.set()
+            return False
+        return accepted[0] and ctx._run_still_current()
+
     # ── blocking prompts from the agent thread (approval / clarify) ─────────────────────────
 
     def _close_native_stream_boundary(self, reason: str, placeholder: str | None = None, reopen: bool = False) -> bool:
@@ -1382,6 +1424,16 @@ class TurnRunner:
 
     # ── run_sync phases ─────────────────────────────────────────────────────────────────────
 
+    def _stale_run_result(self) -> Dict[str, Any]:
+        """Return the normal empty result used when /stop or /new revoked this worker."""
+        ctx = self._ctx
+        return {
+            "final_response": "", "messages": [], "api_calls": 0, "tools": [],
+            "history_offset": len(ctx.history or []), "session_id": ctx.session_id,
+            "interrupted": True, "completed": False,
+            "turn_exit_reason": "stale_run_generation",
+        }
+
     def _load_turn_history(self, agent, reused_cached_agent):
         from gateway.run import (
             _build_gateway_agent_history, _collect_history_media_paths, _message_timestamps_enabled,
@@ -1554,14 +1606,21 @@ class TurnRunner:
         ctx.result_holder[0] = result
         if stream_consumer is None:
             return
+        adapter = self._runner._adapter_for_source(ctx.source)
+        response_streaming_enabled = bool(
+            adapter is not None and getattr(adapter, "supports_response_streaming", True)
+        )
         # Pass final_response as the authoritative finalize payload: it includes post-stream
         # augmentation (verifier footer, explainer) the accumulator never saw. Adopt ONLY a genuinely
         # completed final: interrupt paths return {interrupted: True, completed: False} with a
         # DIAGNOSTIC final_response — adopting it would seal the partial answer over with the
-        # diagnostic AND suppress the gateway's own error delivery.
+        # diagnostic AND suppress the gateway's own error delivery.  Adapters with a delivery
+        # policy may still request a consumer for interim updates; never let that consumer publish
+        # the terminal response before the policy runs.
         _final_for_stream = None
         if (
-            isinstance(result, dict) and not result.get("failed") and not result.get("interrupted")
+            response_streaming_enabled
+            and isinstance(result, dict) and not result.get("failed") and not result.get("interrupted")
             and result.get("completed") is not False
         ):
             fr = result.get("final_response")
@@ -1714,6 +1773,11 @@ class TurnRunner:
         # session via contextvars (set_current_session_key / session context), and only the TUI slash-worker
         # *subprocess* exports HERMES_SESSION_KEY (from its own --session-key argv, a separate process) — so
         # removing this in-process gateway write does not affect any of them.
+        # The async preflight runs before this executor is scheduled, but /stop and /new can
+        # revoke the generation while this worker is queued or while it is constructing an agent.
+        # Keep this check on the worker side as the last authority before model/tool work.
+        if not ctx._run_still_current():
+            return self._stale_run_result()
         platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
         combined_ephemeral = self._combined_ephemeral_prompt()
         max_iterations = _current_max_iterations()
@@ -1727,18 +1791,30 @@ class TurnRunner:
             )
         except Exception as exc:
             return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": []}
+        if not ctx._run_still_current():
+            return self._stale_run_result()
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
         runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
         stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        if not ctx._run_still_current():
+            return self._stale_run_result()
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
+        # Agent construction may perform tool/provider setup. Publish the native interrupt handle
+        # through the loop before callbacks or model/tool work can begin. This is a rendezvous, not
+        # a best-effort polling promotion: /stop either sees this agent or invalidates the run before
+        # it is admitted.
+        if not self._publish_agent_for_interrupt(agent):
+            return self._stale_run_result()
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
+        if not ctx._run_still_current():
+            return self._stale_run_result()
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor

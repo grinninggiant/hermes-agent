@@ -24,6 +24,10 @@ from utils import normalize_proxy_url
 logger = logging.getLogger(__name__)
 
 
+class TurnDeliveryPreparationError(RuntimeError):
+    """An adapter could not safely decide whether terminal turn content may leave."""
+
+
 def _consume_detached_handler_exception(task: "asyncio.Task") -> None:
     """Done-callback for a detached fatal-error handler task (carrier cancelled in
     ``_notify_fatal_error``): retrieve its exception so asyncio never logs "never retrieved"."""
@@ -423,6 +427,7 @@ def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = Non
 
 import dataclasses
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
 
@@ -1440,6 +1445,22 @@ class CachedMedia:
         return f"[{self.kind} '{self.display_name}' saved at: {self.path}]"
 
 
+class GoalStatusNoticeKind(str, Enum):
+    """Native post-turn status families exposed to adapter delivery policy."""
+
+    GOAL = "goal"
+    LOOP = "loop"
+
+
+@dataclass(frozen=True)
+class GoalStatusNotice:
+    """A native goal/loop status notice before it reaches platform egress."""
+
+    kind: GoalStatusNoticeKind
+    status: Optional[str]
+    text: str
+
+
 # MIME -> extension reverse lookup; FIRST match across image, video, document tables wins
 # (built in reverse so the earliest extension is the one that survives).
 _MIME_TO_EXT: Dict[str, str] = {
@@ -1792,6 +1813,75 @@ class BasePlatformAdapter(ABC):
     # adapters (API server). Propagated to ``HERMES_SESSION_ASYNC_DELIVERY`` so tools never promise
     # a delivery they can't keep.
     supports_async_delivery: bool = True
+    # Some platforms must classify the immutable completed-turn result before any response
+    # token reaches their external session. They opt out of response streaming here; interim
+    # status/thought delivery remains independently configurable.
+    supports_response_streaming: bool = True
+
+    async def prepare_turn_delivery(
+        self, event: MessageEvent, response: Any, turn_result: Any,
+    ) -> Any:
+        """Return the response allowed to enter this platform's final-delivery path.
+
+        ``turn_result`` is the immutable classification of a completed agent turn. An
+        override may replace or suppress the response; exceptions deliberately fail
+        closed in the normal processing error path.
+        """
+        return response
+
+    async def prepare_goal_status_notice(
+        self, source: SessionSource, notice: GoalStatusNotice,
+    ) -> Optional[GoalStatusNotice]:
+        """Return the native goal status notice allowed to reach this platform.
+
+        Adapters may return a replacement or ``None`` to suppress it. The gateway
+        fails closed for this notice if an override raises or returns another type.
+        """
+        return notice
+
+    async def allow_internal_execution(self, event: Any) -> bool:
+        """Return whether an admitted internal event may enter its message handler.
+
+        Adapters with a durable ownership fence may override this. External events never
+        consult the hook, and the default preserves existing adapter behavior.
+        """
+        return True
+
+    async def _internal_execution_allowed(self, event: Any) -> bool:
+        if not bool(getattr(event, "internal", False)):
+            return True
+        try:
+            return (await self.allow_internal_execution(event)) is not False
+        except Exception as exc:
+            logger.error("[%s] allow_internal_execution failed closed: %s", self.name, exc, exc_info=True)
+            return False
+
+    async def _response_after_delivery_decision(
+        self, event: MessageEvent, response: Any,
+    ) -> Any:
+        """Apply the post-turn policy unless a successful stream already delivered it."""
+        turn_result = getattr(event, "_gateway_turn_result", None)
+        # Slash commands, routing rejections, and other non-agent handler paths have no
+        # classified turn. They retain their existing delivery behavior and completion
+        # outcome; the policy boundary is exclusively for completed agent turns.
+        if turn_result is None:
+            return response
+        if getattr(event, "_gateway_delivery_prepared_result", None) is turn_result:
+            return response
+        if (
+            bool(turn_result.get("already_sent", False))
+            and turn_result.get("completed") is True
+            and not bool(turn_result.get("failed", False))
+            and not bool(turn_result.get("interrupted", False))
+        ):
+            return response
+        try:
+            prepared = await self.prepare_turn_delivery(event, response, turn_result)
+        except Exception as exc:
+            raise TurnDeliveryPreparationError("prepare_turn_delivery failed") from exc
+        event._gateway_delivery_prepared_result = turn_result
+        return prepared
+
     # ``send()`` chunks natively via ``truncate_message()`` -> the router skips its truncation.
     splits_long_messages: bool = False
     # Prefix users can always TYPE for Hermes commands ("!" where the client eats a leading "/").
@@ -3960,7 +4050,13 @@ class BasePlatformAdapter(ABC):
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
             await self._run_processing_hook("on_processing_start", event)
+            if not await self._internal_execution_allowed(event):
+                await self._run_processing_hook(
+                    "on_processing_complete", event, ProcessingOutcome.CANCELLED,
+                )
+                return
             response = await self._message_handler(event)
+            response = await self._response_after_delivery_decision(event, response)
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
@@ -4002,7 +4098,10 @@ class BasePlatformAdapter(ABC):
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            rejected = bool(getattr(event, "_gateway_rejection_reason", None))
+            processing_ok = (
+                delivery_succeeded if delivery_attempted else not bool(response) and not rejected
+            )
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
@@ -4020,6 +4119,9 @@ class BasePlatformAdapter(ABC):
                 await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
                 self._spawn_drain_task(pending_event, session_key)
                 return  # Drain task owns the session now.
+        except TurnDeliveryPreparationError:
+            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+            logger.error("[%s] prepare_turn_delivery failed closed", self.name, exc_info=True)
         except asyncio.CancelledError:
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(

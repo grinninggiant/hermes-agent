@@ -8,19 +8,32 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
+from dataclasses import dataclass
 import logging
 import time
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
+from gateway.platforms.base import GoalStatusNotice, GoalStatusNoticeKind
 from gateway.platforms.event import MessageEvent, MessageType
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
     from gateway.run_turn_runner import TurnRunner  # noqa: F401
+    from gateway.session import SessionSource
+    from hermes_cli.goals import GoalContract, GoalState
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+@dataclass(frozen=True)
+class GoalResumeResult:
+    """Detached resumed state and the prompt an adapter may schedule itself."""
+
+    state: Optional["GoalState"]
+    continuation_prompt: Optional[str]
 
 
 class GatewayGoalsMixin:
@@ -89,6 +102,97 @@ class GatewayGoalsMixin:
             max_turns = self._goal_max_turns_from_config()
             return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns)
         return await self._manager_for_event(event, "goal", _load)
+
+    async def _goal_session_id_for_source(
+        self, source: "SessionSource", session_id: Optional[str],
+    ) -> str:
+        """Resolve a goal session without rebinding an explicitly pinned recovery."""
+        if session_id is not None:
+            resolved = str(session_id).strip()
+            if not resolved:
+                raise ValueError("session_id must be a non-empty string")
+            return resolved
+        session_entry = await self.async_session_store.get_or_create_session(
+            source, touch_activity=False,
+        )
+        resolved = str(getattr(session_entry, "session_id", "") or "").strip()
+        if not resolved:
+            raise RuntimeError("source has no resolved gateway session")
+        return resolved
+
+    async def ensure_goal_for_source(
+        self,
+        source: "SessionSource",
+        goal: str,
+        *,
+        contract: "GoalContract",
+        session_id: Optional[str] = None,
+    ) -> "GoalState":
+        """Create the source session's goal if it has no active or paused goal."""
+        with self._profile_scope_for_source(source):
+            await self._warm_goals_session_db("source-scoped goal ensure")
+            resolved = await self._goal_session_id_for_source(source, session_id)
+            from hermes_cli.goals import GoalContract, GoalManager
+
+            if not isinstance(contract, GoalContract):
+                raise TypeError("contract must be a GoalContract")
+            manager = GoalManager(
+                session_id=resolved,
+                default_max_turns=self._goal_max_turns_from_config(),
+            )
+            state = manager.state if manager.has_goal() else manager.set(goal, contract=contract)
+            return deepcopy(state)
+
+    async def goal_state_for_source(
+        self, source: "SessionSource", *, session_id: Optional[str] = None,
+    ) -> Optional["GoalState"]:
+        """Read a detached snapshot of the exact source session's goal state."""
+        with self._profile_scope_for_source(source):
+            await self._warm_goals_session_db("source-scoped goal read")
+            resolved = await self._goal_session_id_for_source(source, session_id)
+            from hermes_cli.goals import GoalManager
+
+            manager = GoalManager(
+                session_id=resolved,
+                default_max_turns=self._goal_max_turns_from_config(),
+            )
+            return deepcopy(manager.state)
+
+    async def resume_goal_for_source(
+        self,
+        source: "SessionSource",
+        *,
+        reset_budget: bool,
+        session_id: Optional[str] = None,
+    ) -> GoalResumeResult:
+        """Resume a source goal without judging or scheduling its next turn."""
+        with self._profile_scope_for_source(source):
+            await self._warm_goals_session_db("source-scoped goal resume")
+            resolved = await self._goal_session_id_for_source(source, session_id)
+            from hermes_cli.goals import GoalManager
+
+            manager = GoalManager(
+                session_id=resolved,
+                default_max_turns=self._goal_max_turns_from_config(),
+            )
+            state = manager.resume(reset_budget=reset_budget)
+            prompt = manager.next_continuation_prompt()
+            return GoalResumeResult(deepcopy(state), prompt)
+
+    async def next_goal_continuation_prompt_for_source(
+        self, source: "SessionSource", *, session_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the prompt an adapter may schedule, without scheduling it."""
+        with self._profile_scope_for_source(source):
+            await self._warm_goals_session_db("source-scoped goal prompt")
+            resolved = await self._goal_session_id_for_source(source, session_id)
+            from hermes_cli.goals import GoalManager
+
+            manager = GoalManager(
+                session_id=resolved,
+                default_max_turns=self._goal_max_turns_from_config(),
+            )
+            return manager.next_continuation_prompt()
 
     async def _get_heartbeat_manager_for_event(self, event: "MessageEvent"):
         """Return ``(HeartbeatManager, session_entry)`` for this event, or ``(None, None)``."""
@@ -201,21 +305,48 @@ class GatewayGoalsMixin:
             logger.debug("goal continuation: no adapter for %s", getattr(source, "platform", None))
         return adapter
 
-    async def _send_goal_status_notice(self, source: Any, message: str) -> None:
+    async def _send_goal_status_notice(
+        self,
+        source: Any,
+        message: str,
+        *,
+        status: Optional[str] = None,
+        kind: GoalStatusNoticeKind = GoalStatusNoticeKind.GOAL,
+    ) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
         adapter = self._goal_notice_adapter(source)
         if not adapter:
             return
+        notice = GoalStatusNotice(kind=kind, status=status, text=message)
+        policy = getattr(adapter, "prepare_goal_status_notice", None)
+        if callable(policy):
+            try:
+                notice = await policy(source, notice)
+            except Exception as exc:
+                logger.warning("goal continuation: notice policy failed closed: %s", exc, exc_info=True)
+                return
+            if notice is None:
+                return
+            if not isinstance(notice, GoalStatusNotice):
+                logger.warning("goal continuation: notice policy returned invalid replacement; suppressing")
+                return
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
-        result = await adapter.send(source.chat_id, message, metadata=metadata)
+        result = await adapter.send(source.chat_id, notice.text, metadata=metadata)
         if result is not None and not getattr(result, "success", True):
             logger.warning(
                 "goal continuation: status send failed: %s", getattr(result, "error", "unknown error"),
             )
 
-    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
+    async def _defer_goal_status_notice_after_delivery(
+        self,
+        source: Any,
+        message: str,
+        *,
+        status: Optional[str] = None,
+        kind: GoalStatusNoticeKind = GoalStatusNoticeKind.GOAL,
+    ) -> None:
         """Send a /goal status line after the main response is delivered.
 
         The adapter sends the agent response after this caller returns, so for reading order use
@@ -227,7 +358,9 @@ class GatewayGoalsMixin:
 
         async def _deliver() -> None:
             try:
-                await self._send_goal_status_notice(source, message)
+                await self._send_goal_status_notice(
+                    source, message, status=status, kind=kind,
+                )
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
 
@@ -293,7 +426,15 @@ class GatewayGoalsMixin:
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            verdict = str(decision.get("verdict") or "").strip().lower()
+            notice_status = (
+                "continue" if decision.get("should_continue")
+                else "wait" if verdict in {"wait", "waiting"}
+                else str(decision.get("status") or verdict or "") or None
+            )
+            await self._defer_goal_status_notice_after_delivery(
+                source, msg, status=notice_status,
+            )
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
             return
@@ -302,7 +443,9 @@ class GatewayGoalsMixin:
             adapter = self._adapter_for_source(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
-                self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
+                self._enqueue_fifo(
+                    _quick_key, self._synthetic_prompt_event(source, prompt, internal=True), adapter,
+                )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
@@ -310,11 +453,37 @@ class GatewayGoalsMixin:
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
+        # Only policy-staged text may outlive a handler returning None. Keep it bound to the
+        # originating session and generation so /new cannot make an old response judge new state.
+        policy_staged = event is not None and getattr(event, "_gateway_post_turn_response_policy_staged", False)
+        if policy_staged:
+            if getattr(event, "_gateway_post_turn_response_stale", False):
+                return
+            origin_key = getattr(event, "_gateway_post_turn_response_session_key", None)
+            origin_id = getattr(event, "_gateway_post_turn_response_session_id", None)
+            origin_generation = getattr(event, "_gateway_post_turn_response_generation", None)
+            if (
+                not origin_key or origin_id is None or origin_generation is None
+                or self._session_key_for_source(source) != origin_key
+                or not self._is_session_run_current(origin_key, origin_generation)
+            ):
+                return
+            current_entry = await self.async_session_store.lookup_by_session_key(origin_key)
+            current_id = getattr(current_entry, "session_id", None) if current_entry is not None else None
+            if (
+                current_entry is None or current_id != origin_id
+                or not self._is_session_run_current(origin_key, origin_generation)
+            ):
+                return
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
         try:
-            session_entry = await self.async_session_store.get_or_create_session(
-                source, touch_activity=not is_internal,
-            )
+            if policy_staged:
+                # Use the exact inspected entry; resolving again could select a replacement.
+                session_entry = current_entry
+            else:
+                session_entry = await self.async_session_store.get_or_create_session(
+                    source, touch_activity=not is_internal,
+                )
         except Exception as exc:
             logger.debug("post-turn session resolution failed: %s", exc)
             return
@@ -341,7 +510,14 @@ class GatewayGoalsMixin:
         if text.strip():
             return text
         streamed = getattr(event, "_streamed_final_response", None)
-        return streamed if isinstance(streamed, str) and streamed.strip() else text
+        if isinstance(streamed, str) and streamed.strip():
+            return streamed
+        if not getattr(event, "_gateway_post_turn_response_policy_staged", False):
+            return text
+        if getattr(event, "_gateway_post_turn_response_stale", False):
+            return text
+        prepared = getattr(event, "_gateway_post_turn_response", None)
+        return prepared if isinstance(prepared, str) and prepared.strip() else text
 
     async def _post_turn_loop_completion(
         self, *, session_entry: Any, source: Any, final_response: str,
@@ -363,7 +539,12 @@ class GatewayGoalsMixin:
         )
         msg = decision.get("message") or ""
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            await self._defer_goal_status_notice_after_delivery(
+                source,
+                msg,
+                status=str(decision.get("status") or decision.get("verdict") or "") or None,
+                kind=GoalStatusNoticeKind.LOOP,
+            )
 
     async def _loop_wakeup_fire_one(self, sid: str, state: Any, now: float, warned_no_route: set) -> None:
         """Inject one due /loop wakeup into its session, applying every deferral rule."""
