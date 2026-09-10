@@ -1067,7 +1067,25 @@ class GoalManager:
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
-        self._state: Optional[GoalState] = load_goal(session_id)
+        self._judge_snapshot: Optional[str] = None
+        self._persisted_snapshot: Optional[str] = None
+        self._judge_stale = False
+        self._evaluating_judge = False
+        self._judge_owner_check = None
+        db = _get_session_db()
+        raw = None
+        if db is not None and session_id:
+            try:
+                raw = db.get_meta(_meta_key(session_id))
+            except Exception as exc:
+                logger.debug("GoalManager: initial get_meta failed: %s", exc)
+        self._state = None
+        if raw:
+            try:
+                self._state = GoalState.from_json(raw)
+                self._persisted_snapshot = raw
+            except Exception as exc:
+                logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
 
     # --- introspection ------------------------------------------------
 
@@ -1113,8 +1131,45 @@ class GoalManager:
     # --- mutation -----------------------------------------------------
 
     def _save(self) -> Optional[GoalState]:
-        save_goal(self.session_id, self._state)
+        if self._judge_snapshot is not None:
+            if self._state is None:
+                return None
+            if self._judge_owner_check is not None:
+                try:
+                    if not self._judge_owner_check():
+                        self._judge_stale = True
+                        return None
+                except Exception:
+                    self._judge_stale = True
+                    return None
+            try:
+                db = _get_session_db()
+                next_snapshot = self._state.to_json()
+                cas_kwargs = {}
+                if self._judge_owner_check is not None:
+                    cas_kwargs["condition"] = self._judge_owner_check
+                saved = db is not None and db.set_meta_if_equals(
+                    _meta_key(self.session_id), self._judge_snapshot, next_snapshot,
+                    **cas_kwargs,
+                )
+            except Exception as exc:
+                logger.debug("GoalManager: conditional goal save failed closed: %s", exc)
+                saved = False
+            if not saved:
+                self._judge_stale = True
+                return None
+            # Keep the CAS armed for the entire evaluation. Later gate/wait/verdict writes
+            # must never fall back to an unconditional save after the first successful CAS.
+            self._persisted_snapshot = next_snapshot
+            self._judge_snapshot = next_snapshot
+        else:
+            save_goal(self.session_id, self._state)
+            if self._state is not None:
+                self._persisted_snapshot = self._state.to_json()
         return self._state
+
+    def _stale_judge_decision(self) -> Dict[str, Any]:
+        return _decision(None, False, None, "stale", "goal ownership changed", "") | {"stale_owner": True}
 
     def _require_goal(self) -> GoalState:
         if self._state is None or not self.has_goal():
@@ -1320,7 +1375,10 @@ class GoalManager:
                 f"attempt {gate.attempts}/{gate.max_retries}){skipped_note}: $ {gate.command}",
             )
 
-        self._save()
+        # A passing gate updates in-memory evidence immediately, but during judge evaluation its
+        # write must be folded into the same post-LLM CAS as the verdict state.
+        if not self._evaluating_judge:
+            self._save()
         return None
 
     # --- /goal wait barrier -------------------------------------------
@@ -1437,6 +1495,36 @@ class GoalManager:
     def evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
+        active_delegations: int = 0, owner_check=None,
+    ) -> Dict[str, Any]:
+        """Evaluate a detached turn while retaining its persistence/ownership fence."""
+        state = self._state
+        if state is None or state.status != "active":
+            return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+
+        # Arm the conditional write before checking a wait barrier: expiry can clear the barrier
+        # and persist that cleanup before the judge runs.
+        self._judge_snapshot = self._persisted_snapshot
+        self._judge_stale = False
+        self._evaluating_judge = True
+        self._judge_owner_check = owner_check
+        try:
+            if owner_check is not None and not owner_check():
+                self._judge_stale = True
+                return self._stale_judge_decision()
+            return self._evaluate_after_turn(
+                last_response, user_initiated=user_initiated,
+                background_processes=background_processes, active_delegations=active_delegations,
+            )
+        finally:
+            self._evaluating_judge = False
+            self._judge_snapshot = None
+            self._judge_owner_check = None
+            self._judge_stale = False
+
+    def _evaluate_after_turn(
+        self, last_response: str, *, user_initiated: bool = True,
+        background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
     ) -> Dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
@@ -1449,6 +1537,8 @@ class GoalManager:
         # Parked on a live process or an unexpired deadline: quiesce without burning a turn.
         if self.is_waiting():
             return self._waiting_decision(state)
+        if self._judge_stale:
+            return self._stale_judge_decision()
 
         state.turns_used += 1
         state.last_turn_at = time.time()
@@ -1457,14 +1547,28 @@ class GoalManager:
         # so the judge is skipped and the gate's output drives the next turn (same turn budget).
         gate_decision = self._check_gates()
         if gate_decision is not None:
+            if self._judge_stale:
+                return self._stale_judge_decision()
             if gate_decision.get("should_continue") and state.turns_used >= state.max_turns:
-                return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
+                decision = self._budget_pause(
+                    state, "gate_failed", gate_decision.get("reason", ""),
+                    note=" (a quality gate is still failing)",
+                )
+                return self._stale_judge_decision() if self._judge_stale else decision
             return gate_decision
 
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
         )
+        if self._judge_owner_check is not None:
+            try:
+                if not self._judge_owner_check():
+                    self._judge_stale = True
+            except Exception:
+                self._judge_stale = True
+        if self._judge_stale:
+            return self._stale_judge_decision()
         state.last_verdict = verdict
         state.last_reason = reason
         # Parse failures reset on any usable reply INCLUDING transport errors, so a flaky network
@@ -1474,45 +1578,54 @@ class GoalManager:
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
 
         if verdict == "wait" and wait_directive:
-            return self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
+            decision = self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
+            return self._stale_judge_decision() if self._judge_stale else decision
 
         # BLOCKED is NOT done: pause so the user sees the judge's reason and can re-scope or override,
         # instead of burning turns on an unachievable goal or waving it through as complete.
         # BLOCKED verdict: the judge ruled the goal genuinely cannot be satisfied as stated (impossible, out
         # of scope, needs user input). See #100954.
         if verdict == "blocked":
-            return self._pause_decision(
+            decision = self._pause_decision(
                 f"judged unachievable: {reason}", "blocked", reason,
                 f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal set, or override with /goal resume.",
             )
+            return self._stale_judge_decision() if self._judge_stale else decision
 
         if verdict == "done":
             state.status = "done"
             self._save()
+            if self._judge_stale:
+                return self._stale_judge_decision()
             return _decision("done", False, None, "done", reason, f"✓ Goal achieved: {reason}")
 
         # Persistent judge failures (API unreachable / unparseable output) auto-pause and point at the
         # goal_judge config so a broken judge can't burn the whole turn budget.
         n_tx, n_parse = state.consecutive_transport_failures, state.consecutive_parse_failures
         if n_tx >= DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES:
-            return self._pause_decision(
+            decision = self._pause_decision(
                 f"judge API unreachable {n_tx} turns in a row (check auxiliary.goal_judge provider/key in config.yaml)",
                 "continue", reason,
                 f"⏸ Goal paused — judge API returned errors ({n_tx} turns). Check the goal_judge provider/key in "
                 + _JUDGE_CONFIG_HINT.format(provider="deepseek", model="deepseek-flash"),
             )
+            return self._stale_judge_decision() if self._judge_stale else decision
         if n_parse >= DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES:
-            return self._pause_decision(
+            decision = self._pause_decision(
                 f"judge model returned unparseable output {n_parse} turns in a row", "continue", reason,
                 f"⏸ Goal paused — the judge model ({n_parse} turns) isn't returning the required JSON verdict. "
                 "Route the judge to a stricter model in "
                 + _JUDGE_CONFIG_HINT.format(provider="openrouter", model="google/gemini-3-flash-preview"),
             )
+            return self._stale_judge_decision() if self._judge_stale else decision
 
         if state.turns_used >= state.max_turns:
-            return self._budget_pause(state, "continue", reason)
+            decision = self._budget_pause(state, "continue", reason)
+            return self._stale_judge_decision() if self._judge_stale else decision
 
         self._save()
+        if self._judge_stale:
+            return self._stale_judge_decision()
         return _decision(
             "active", True, self.next_continuation_prompt(), "continue", reason,
             f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}",

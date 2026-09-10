@@ -1250,6 +1250,10 @@ class GatewayInboundMixin:
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        # Own the complete outer lifecycle before the agent cleanup can release its running slot.
+        # The active-work aggregate excludes this owner while the agent slot is still present, so
+        # the same turn is not counted twice; it remains visible during the post-turn handoff gap.
+        _post_turn_owner = self._claim_post_turn_work(_quick_key, _run_generation)
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
@@ -1275,26 +1279,23 @@ class GatewayInboundMixin:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
-            # MoA one-shot restore must run on EVERY exit path (success, exception, interrupt):
-            # the restore data lives on the per-turn event and would leak permanently otherwise.
-            self._restore_moa_one_shot(event, _quick_key)
-            self._restore_pending_one_turn_model_override(_quick_key)
-            # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
-            # recovery pass.
-            await self._clear_durable_active_turn(event)
-            # Unconditional, idempotent release without a run_generation guard: evicts the zombie
-            # left when session_reset bumps the generation mid-flight (gen-N's guarded release in
-            # _run_agent returns False; a sentinel-only check would lock forever).
-            self._release_running_agent_state(_quick_key)
-            # Turn lease is keyed by (routing key, run generation) so this unwind can only free
-            # the lease its own turn acquired, never a newer turn's.
-            # Unconditional release covers every exit path. _release_running_agent_state is idempotent
-            # (pop-on-absent is harmless) and, called without a run_generation guard, always clears the slot
-            # regardless of which generation it holds. This evicts the zombie left when session_reset bumps
-            # the generation (N -> N+1) mid-flight: gen-N's guarded release inside _run_agent returns False,
-            # and the old sentinel-only check here missed the leftover real agent — locking the session out
-            # forever (#28686).
-            self._release_turn_lease(_quick_key, _run_generation)
+            try:
+                # MoA one-shot restore must run on EVERY exit path (success, exception, interrupt).
+                self._restore_moa_one_shot(event, _quick_key)
+                self._restore_pending_one_turn_model_override(_quick_key)
+                # Keep the owner through durable cleanup: a newer generation may be admitted while
+                # this await is pending.
+                await self._clear_durable_active_turn(event)
+            finally:
+                # Generation ownership prevents N's late unwind from clearing N+1's state. This
+                # runs on cancellation/error as well as the normal path.
+                try:
+                    self._release_running_agent_state(_quick_key, run_generation=_run_generation)
+                finally:
+                    try:
+                        self._release_turn_lease(_quick_key, _run_generation)
+                    finally:
+                        self._release_post_turn_work(_post_turn_owner)
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn (called from the
