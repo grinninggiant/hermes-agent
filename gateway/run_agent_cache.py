@@ -432,6 +432,31 @@ class GatewayAgentCacheMixin:
             # See #44212.
             self._evict_cached_agent(session_key)
 
+    async def interrupt_session_processing(
+        self, source: SessionSource, *, reason: str = "platform_stop",
+        expected_session_id: Optional[str] = None,
+    ) -> bool:
+        """Interrupt the session currently routed from ``source``.
+
+        This is the public, source-scoped seam for platform integrations.  It deliberately
+        delegates to the native interrupt funnel so hard interruption, generation invalidation,
+        process cleanup, pending-message cleanup, and cache eviction remain one operation.
+        """
+        session_key = self._session_key_for_source(source)
+        if not session_key:
+            return False
+        if expected_session_id is not None:
+            entry = await self.async_session_store.lookup_by_session_key(session_key)
+            if entry is None or entry.session_id != expected_session_id:
+                return False
+        await self._interrupt_and_clear_session(
+            session_key,
+            source,
+            interrupt_reason=reason,
+            invalidation_reason=reason,
+        )
+        return True
+
     async def _refresh_agent_cache_message_count(self, session_key: str, session_id: Optional[str]) -> None:
         """Re-baseline a cached agent's stored message_count after THIS turn — the coherence guard
         rebuilds on mismatch, so without this every turn would rebuild and destroy prompt caching.

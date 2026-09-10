@@ -15,13 +15,14 @@ import os
 import queue
 import threading
 import time
+from types import MappingProxyType
 from agent.i18n import t
 from agent.session_activity import format_iteration_progress
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, TurnDeliveryPreparationError
 from gateway.platforms.event import MessageEvent
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
@@ -45,6 +46,25 @@ logger = logging.getLogger("gateway.run")
 
 class GatewayTurnMixin:
     """Agent-turn execution for GatewayRunner (see module docstring)."""
+
+    @staticmethod
+    def _immutable_gateway_turn_result(agent_result: Any, session_id: Optional[str]) -> MappingProxyType:
+        result = agent_result if isinstance(agent_result, dict) else {}
+        return MappingProxyType({
+            "completed": result.get("completed"),
+            "failed": bool(result.get("failed", False)),
+            "interrupted": bool(result.get("interrupted", False)),
+            "turn_exit_reason": result.get("turn_exit_reason"),
+            "session_id": result.get("session_id") or session_id,
+            "input_tokens": int(result.get("input_tokens", 0) or 0),
+            "output_tokens": int(result.get("output_tokens", 0) or 0),
+            "already_sent": bool(result.get("already_sent", False)),
+        })
+
+    @staticmethod
+    def _reject_strict_session_event(event: Any, reason: str) -> None:
+        event._gateway_rejection_reason = reason
+        event.metadata["gateway_session_rejected"] = reason
 
     def _resolve_session_agent_runtime(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
@@ -275,6 +295,7 @@ class GatewayTurnMixin:
         if expected_session_key:
             derived_session_key = self._session_key_for_source(source)
             if derived_session_key != expected_session_key:
+                self._reject_strict_session_event(event, "expected_session_key_mismatch")
                 logger.warning(
                     "Dropping internally routed event after route recovery: expected session=%s derived=%s",
                     expected_session_key, derived_session_key,
@@ -286,6 +307,7 @@ class GatewayTurnMixin:
         if strict_session:
             session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
             if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id:
+                self._reject_strict_session_event(event, "strict_session_identity_mismatch")
                 logger.warning(
                     "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
                     pinned_session_id or "missing", expected_session_key or "missing",
@@ -1802,8 +1824,10 @@ class GatewayTurnMixin:
             "Try again or use /reset to start a fresh session."
         )
 
-    def _hmwa_discard_stale_result(self, source, _quick_key, run_generation):
+    def _hmwa_discard_stale_result(self, source, _quick_key, run_generation, event=None):
         """A newer run generation superseded this turn: drop its deferred post-delivery callback."""
+        if event is not None:
+            event._gateway_post_turn_response_stale = True
         logger.info(
             "Discarding stale agent result for %s — generation %d is no longer current",
             _quick_key or "?", run_generation,
@@ -1955,6 +1979,26 @@ class GatewayTurnMixin:
             from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
             if not heartbeat_owner_is_current(self, event, session_key):
                 return
+            event_metadata = getattr(event, "metadata", None) or {}
+            if bool(event_metadata.get("gateway_session_strict")):
+                expected_key = str(event_metadata.get("gateway_session_key") or "").strip()
+                pinned_id = str(event_metadata.get("gateway_session_id") or "").strip()
+                if self._session_key_for_source(source) != expected_key:
+                    self._reject_strict_session_event(event, "expected_session_key_mismatch")
+                    logger.warning(
+                        "Dropping internally routed event immediately before execution: expected session=%s",
+                        expected_key or "missing",
+                    )
+                    return
+                current_entry = await self.async_session_store.lookup_by_session_key(expected_key)
+                if current_entry is None or not pinned_id or current_entry.session_id != pinned_id:
+                    self._reject_strict_session_event(event, "strict_session_identity_mismatch")
+                    logger.warning(
+                        "Dropping internally routed event immediately before execution: expected session id=%s is no longer current for key=%s",
+                        pinned_id or "missing", expected_key or "missing",
+                    )
+                    return
+                session_entry = current_entry
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
             # Admission/typing is not execution. All routing, authorization and
@@ -1970,7 +2014,7 @@ class GatewayTurnMixin:
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 persist_user_display_metadata={"gateway_input_owner": prepared.persistence_owner},
-                message_type=event.message_type,
+                message_type=event.message_type, gateway_event=event,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -1986,7 +2030,7 @@ class GatewayTurnMixin:
             await self._hmwa_stop_typing_for_turn(event, source)
 
             if not self._is_session_run_current(_quick_key, run_generation):
-                self._hmwa_discard_stale_result(source, _quick_key, run_generation)
+                self._hmwa_discard_stale_result(source, _quick_key, run_generation, event)
                 return None
 
             response, _intentional_silence, agent_messages = await self._hmwa_shape_agent_response(
@@ -1994,6 +2038,8 @@ class GatewayTurnMixin:
                 _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
             )
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
+            # Post-turn goal/loop bookkeeping evaluates the model's terminal text even when a
+            # platform policy suppresses external delivery below.
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
             # Streaming already delivered the body: the footer goes out as a trailing send instead.
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
@@ -2006,6 +2052,14 @@ class GatewayTurnMixin:
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
             )
+            # Stage policy text only after response shaping has propagated a legitimate native
+            # compaction child into the current binding. The post-turn hook then pins the exact
+            # validated child entry; an unrelated /new still fails its exact id/generation guard.
+            event._gateway_post_turn_response = response
+            event._gateway_post_turn_response_policy_staged = True
+            event._gateway_post_turn_response_session_key = _quick_key
+            event._gateway_post_turn_response_session_id = session_entry.session_id
+            event._gateway_post_turn_response_generation = run_generation
             await self._hmwa_persist_turn_transcript(
                 event=event, source=source, session_entry=session_entry, session_key=session_key,
                 agent_result=agent_result, agent_messages=agent_messages, prepared=prepared,
@@ -2013,11 +2067,25 @@ class GatewayTurnMixin:
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
             )
+            if not self._is_session_run_current(_quick_key, run_generation):
+                self._hmwa_discard_stale_result(source, _quick_key, run_generation, event)
+                return None
+            adapter = self._adapter_for_source(source)
+            if isinstance(adapter, BasePlatformAdapter):
+                event._gateway_turn_result = self._immutable_gateway_turn_result(
+                    agent_result, _run_start_session_id,
+                )
+                response = await adapter._response_after_delivery_decision(event, response)
+                if not self._is_session_run_current(_quick_key, run_generation):
+                    self._hmwa_discard_stale_result(source, _quick_key, run_generation, event)
+                    return None
             return await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
             )
 
+        except TurnDeliveryPreparationError:
+            raise
         except Exception as e:
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
@@ -2415,13 +2483,14 @@ class GatewayTurnMixin:
         _streaming_enabled = (
             _scfg.enabled and _scfg.transport != "off" if _plat_streaming is None else bool(_plat_streaming)
         )
+        _adapter = self._adapter_for_source(source)
+        _streaming_enabled = _streaming_enabled and bool(
+            _adapter is not None and getattr(_adapter, "supports_response_streaming", True)
+        )
         if not _streaming_enabled:
             return None
         try:
             from gateway.stream_consumer import GatewayStreamConsumer
-            _adapter = self._adapter_for_source(source)
-            if not _adapter:
-                return None
             _consumer_cfg, _pause_typing_before_finalize = self._build_stream_consumer_config(
                 source, _scfg, _adapter, on_missing_cursor="fallback",
             )
@@ -2581,7 +2650,55 @@ class GatewayTurnMixin:
         """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
         when multiplexing is off)."""
         with self._profile_scope_for_source(source):
+            rejection = await self._run_agent_preflight(
+                source=source, session_id=session_id, history=history,
+                gateway_event=turn_kwargs.get("gateway_event"),
+                session_key=turn_kwargs.get("session_key"),
+            )
+            if rejection is not None:
+                return rejection
             return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
+
+    async def _run_agent_preflight(
+        self, *, source: SessionSource, session_id: str, history: List[Dict[str, Any]],
+        gateway_event: Any, session_key: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Apply internal wake veto and strict session binding immediately before worker launch."""
+        if gateway_event is None or not bool(getattr(gateway_event, "internal", False)):
+            return None
+
+        adapter = self._adapter_for_source(source)
+        allowed = getattr(adapter, "_internal_execution_allowed", None)
+        if callable(allowed) and not await allowed(gateway_event):
+            gateway_event._gateway_rejection_reason = "internal_execution_veto"
+            return {
+                "final_response": None,
+                "messages": history,
+                "interrupted": True,
+                "completed": False,
+                "turn_exit_reason": "internal_execution_rejected",
+                "session_id": session_id,
+            }
+
+        metadata = getattr(gateway_event, "metadata", None) or {}
+        if not bool(metadata.get("gateway_session_strict")):
+            return None
+        expected_key = str(metadata.get("gateway_session_key") or "").strip()
+        pinned_id = str(metadata.get("gateway_session_id") or "").strip()
+        if not expected_key or self._session_key_for_source(source) != expected_key:
+            self._reject_strict_session_event(gateway_event, "expected_session_key_mismatch")
+            return {
+                "final_response": None, "messages": history, "interrupted": True,
+                "completed": False, "turn_exit_reason": "strict_session_rejected", "session_id": session_id,
+            }
+        current_entry = await self.async_session_store.lookup_by_session_key(expected_key)
+        if current_entry is None or not pinned_id or current_entry.session_id != pinned_id:
+            self._reject_strict_session_event(gateway_event, "strict_session_identity_mismatch")
+            return {
+                "final_response": None, "messages": history, "interrupted": True,
+                "completed": False, "turn_exit_reason": "strict_session_rejected", "session_id": session_id,
+            }
+        return None
 
     def _run_agent_display_settings(self, source: SessionSource) -> "GatewayRunner._RunAgentDisplay":
         """Resolve per-platform display, progress, status and streaming-surface settings for a turn."""
@@ -2900,7 +3017,12 @@ class GatewayTurnMixin:
             message_type is not None
             and str(getattr(message_type, "value", message_type)).lower() == "voice"
         )
-        if _stts_adapter is None or not _is_voice_input or not _stts_adapter._should_auto_tts_for_chat(source.chat_id):
+        if (
+            _stts_adapter is None
+            or not getattr(_stts_adapter, "supports_response_streaming", True)
+            or not _is_voice_input
+            or not _stts_adapter._should_auto_tts_for_chat(source.chat_id)
+        ):
             return
         try:
             from gateway.streaming_tts_consumer import StreamingTTSConsumer
@@ -3370,6 +3492,21 @@ class GatewayTurnMixin:
         # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
         _delivery_result = response if isinstance(response, dict) else (result or {})
         first_response = _delivery_result.get("final_response", "")
+        gateway_event = getattr(turn_ctx, "gateway_event", None)
+        if not turn_ctx._run_still_current():
+            return
+        if (
+            gateway_event is not None
+            and isinstance(adapter, BasePlatformAdapter)
+        ):
+            gateway_event._gateway_turn_result = self._immutable_gateway_turn_result(
+                _delivery_result, getattr(turn_ctx, "session_id", None),
+            )
+            first_response = await adapter._response_after_delivery_decision(
+                gateway_event, first_response,
+            )
+            if not turn_ctx._run_still_current():
+                return
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
@@ -3514,6 +3651,7 @@ class GatewayTurnMixin:
             run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
             event_message_id=next_message_id, inbound_message_id=next_inbound_id,
             channel_prompt=next_channel_prompt, message_type=next_message_type,
+            gateway_event=pending_event or getattr(turn_ctx, "gateway_event", None),
         )
         merged = _preserve_queued_followup_history_offset(result, followup_result)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
@@ -3811,6 +3949,7 @@ class GatewayTurnMixin:
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
+        gateway_event: Any = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -3835,6 +3974,7 @@ class GatewayTurnMixin:
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
+            gateway_event=gateway_event,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
