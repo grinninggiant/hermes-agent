@@ -23,6 +23,7 @@ def tool_hook_ids(agent, effective_task_id: str, tool_call_id: Optional[str]) ->
         "tool_call_id": tool_call_id or "",
         "turn_id": getattr(agent, "_current_turn_id", "") or "",
         "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
+        "execution_context": getattr(agent, "_memory_write_context", "foreground") or "foreground",
     }
 
 
