@@ -192,8 +192,9 @@ class GatewayShutdownMixin:
         """
         owners = getattr(self, "_post_turn_work_owners", None)
         if not isinstance(owners, dict):
-            return 0
+            owners = {}
         running = set(getattr(self, "_running_agents", {}) or {})
+        covered_keys = running | {value[1] for value in owners.values()}
         count = 0
         for value in owners.values():
             if len(value) == 3:
@@ -208,7 +209,22 @@ class GatewayShutdownMixin:
                 and not self._is_session_run_current(session_key, generation)
             ):
                 count += 1
-        return count
+        # The adapter still owns response preparation and on_processing_complete
+        # after the inbound handler releases its core owner. Drain that real task
+        # too, or shutdown can cancel an otherwise successful delivery as Stop.
+        registries = [getattr(self, "adapters", {})]
+        registries.extend((getattr(self, "_profile_adapters", {}) or {}).values())
+        pending_tasks = set()
+        for registry in registries:
+            for adapter in registry.values():
+                tasks = getattr(adapter, "_session_tasks", None)
+                if not isinstance(tasks, dict):
+                    continue
+                pending_tasks.update(
+                    task for key, task in tasks.items()
+                    if key not in covered_keys and isinstance(task, asyncio.Task) and not task.done()
+                )
+        return count + len(pending_tasks)
 
     def _claim_post_turn_work(self, session_key: str, run_generation: int) -> object:
         """Claim one post-turn handoff; the returned opaque owner is released exactly once."""
