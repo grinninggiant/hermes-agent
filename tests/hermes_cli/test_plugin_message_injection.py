@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import yaml
+import pytest
 
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
@@ -22,6 +23,49 @@ def _write_plugin_config(tmp_path, monkeypatch, entry: dict) -> None:
         yaml.safe_dump({"plugins": {"entries": {"notify-plugin": entry}}})
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+
+async def _async_guard():
+    return True
+
+
+@pytest.mark.parametrize("binding,guard", [(None, lambda: True), ("session", True), ("session", _async_guard)])
+def test_guarded_injection_requires_exact_binding_and_sync_guard(tmp_path, monkeypatch, binding, guard):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+    assert context.inject_message("wake", session_key="agent:main:telegram:dm:42",
+                                  expected_session_id=binding, dispatch_guard=guard) is False
+    injector.assert_not_called()
+
+
+def test_guard_returning_coroutine_is_rejected_without_leaking_it(tmp_path, monkeypatch, recwarn):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+    assert context.inject_message("wake", session_key="agent:main:telegram:dm:42",
+        expected_session_id="session", dispatch_guard=lambda: _async_guard()) is True
+    guard = injector.call_args.kwargs["dispatch_guard"]
+    assert guard() is False
+    assert not [w for w in recwarn.list if "never awaited" in str(w.message)]
+
+
+@pytest.mark.parametrize("ambient,owned", [(True, False), (False, True)])
+def test_gateway_permission_belongs_to_manager_home(tmp_path, monkeypatch, ambient, owned):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": ambient})
+    owner_home = tmp_path / "owner"
+    owner_home.mkdir()
+    (owner_home / "config.yaml").write_text(yaml.safe_dump({
+        "plugins": {"entries": {"notify-plugin": {"allow_gateway_injection": owned}}}
+    }))
+    manager = PluginManager(scope_key=str(owner_home))
+    context = PluginContext(PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager)
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+    assert context.inject_message("wake", session_key="agent:main:telegram:dm:42") is owned
+    assert injector.call_count == int(owned)
 
 
 def test_cli_idle_injection_keeps_existing_queue_behaviour():
