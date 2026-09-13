@@ -926,7 +926,12 @@ def sync_skills(quiet: bool = False) -> dict:
         dest_desc = SKILLS_DIR / rel
         if not dest_desc.exists():
             try:
-                dest_desc.parent.mkdir(parents=True, exist_ok=True)
+                # Do not resurrect metadata for retired or external-only categories.
+                # Existing descriptions and nested user skills remain untouched.
+                if not dest_desc.parent.is_dir() or not any(
+                    path.is_file() for path in dest_desc.parent.rglob("SKILL.md")
+                ):
+                    continue
                 shutil.copy2(desc_md, dest_desc)
             except (OSError, IOError) as e:
                 logger.debug("Could not copy %s: %s", desc_md, e)
