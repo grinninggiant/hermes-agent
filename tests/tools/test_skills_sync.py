@@ -442,6 +442,40 @@ class TestSyncSkills:
         assert "new-skill" in result["copied"]
         assert (skills_dir / "category" / "new-skill" / "SKILL.md").exists()
 
+    @pytest.mark.parametrize("retired_by", ["deleted", "suppressed"])
+    def test_retired_category_is_not_recreated_by_sync(self, tmp_path, retired_by):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        skills_dir.mkdir()
+        manifest_file = skills_dir / ".bundled_manifest"
+        if retired_by == "deleted":
+            manifest_file.write_text("new-skill:previous-hash\n")
+        suppressed = {"new-skill"} if retired_by == "suppressed" else set()
+        with self._patches(bundled, skills_dir, manifest_file), patch(
+            "tools.skills_sync._read_suppressed_names", return_value=suppressed
+        ):
+            sync_skills(quiet=True)
+            sync_skills(quiet=True)
+        assert not (skills_dir / "category").exists()
+        assert (skills_dir / "old-skill" / "SKILL.md").is_file()
+
+    def test_category_descriptions_follow_local_skills_without_overwriting(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        (bundled / "category" / "nested").mkdir()
+        (bundled / "category" / "nested" / "DESCRIPTION.md").write_text("Nested desc")
+        skills_dir = tmp_path / "user_skills"
+        local = skills_dir / "category" / "nested" / "custom"
+        local.mkdir(parents=True)
+        (local / "SKILL.md").write_text("# Custom")
+        category_desc = skills_dir / "category" / "DESCRIPTION.md"
+        category_desc.write_text("User description")
+        manifest_file = skills_dir / ".bundled_manifest"
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+        assert category_desc.read_text() == "User description"
+        assert (local.parent / "DESCRIPTION.md").read_text() == "Nested desc"
+        assert (local / "SKILL.md").read_text() == "# Custom"
+
     def test_fresh_install_copies_all_and_records_origin_hashes(self, tmp_path):
         bundled = self._setup_bundled(tmp_path)
         skills_dir = tmp_path / "user_skills"

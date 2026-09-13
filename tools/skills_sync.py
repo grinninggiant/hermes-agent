@@ -354,7 +354,12 @@ def _seed_category_descriptions(bundled_dir: Path, only_dirs: Optional[Set[Path]
         if (only_dirs is not None and dest_desc.parent not in only_dirs) or dest_desc.exists():
             continue
         try:
-            dest_desc.parent.mkdir(parents=True, exist_ok=True)
+            # Retired or externally supplied packages must not recreate empty
+            # local categories; user-created nested skills still need metadata.
+            if not dest_desc.parent.is_dir() or not any(
+                path.is_file() for path in dest_desc.parent.rglob("SKILL.md")
+            ):
+                continue
             shutil.copy2(desc_md, dest_desc)
         except OSError as e:
             logger.debug("Could not copy %s: %s", desc_md, e)
