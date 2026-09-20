@@ -5,7 +5,7 @@ import path from 'node:path'
 
 import { expect, test } from 'vitest'
 
-import { bundleHash, runBundleOffline } from './bundle-offline'
+import { bundleHash, copyBundle, runBundleOffline } from './bundle-offline'
 import { normalizeRegistry } from './connection-registry'
 import { assertBundleReady, writeConnectionsRegistry } from './connection-registry-store'
 
@@ -35,6 +35,12 @@ test.each(['packaged', 'source'])(
           [candidate, 'a'.repeat(40)]
         ]) {
           fs.mkdirSync(path.join(dir, 'Contents/Resources'), { recursive: true })
+          fs.chmodSync(dir, 0o700)
+          fs.chmodSync(path.join(dir, 'Contents'), 0o710)
+          fs.chmodSync(path.join(dir, 'Contents/Resources'), 0o700)
+          fs.writeFileSync(path.join(dir, 'Contents/Resources/private'), 'private', { mode: 0o600 })
+          fs.symlinkSync('Resources/private', path.join(dir, 'Contents/private-link'))
+          fs.lchmodSync(path.join(dir, 'Contents/private-link'), 0o700)
           fs.writeFileSync(
             path.join(dir, 'Contents/Resources/install-stamp.json'),
             JSON.stringify({ commit, dirty: false, source: 'local' })
@@ -162,6 +168,43 @@ test.each(['packaged', 'source'])(
   },
   60000
 )
+
+test('copy preserves restrictive modes without following even external or dangling links', () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bundle-modes-')))
+
+  try {
+    const source = path.join(root, 'source'),
+      destination = path.join(root, 'copy')
+
+    fs.mkdirSync(source, { mode: 0o700 })
+    fs.mkdirSync(path.join(source, 'private'), { mode: 0o700 })
+    const outside = path.join(root, 'outside')
+    fs.writeFileSync(outside, 'untouched', { mode: 0o600 })
+    fs.writeFileSync(path.join(source, 'private/file'), 'private', { mode: 0o640 })
+
+    for (const [name, target] of [
+      ['external', outside],
+      ['dangling', 'missing'],
+      ['internal', 'private/file']
+    ]) {
+      fs.symlinkSync(target, path.join(source, name))
+      fs.lchmodSync(path.join(source, name), 0o700)
+    }
+
+    copyBundle(source, destination)
+
+    for (const name of ['', 'private', 'private/file', 'external', 'dangling', 'internal']) {
+      expect(fs.lstatSync(path.join(destination, name)).mode).toBe(fs.lstatSync(path.join(source, name)).mode)
+    }
+
+    expect(fs.lstatSync(outside).mode & 0o777).toBe(0o600)
+    expect(fs.readFileSync(outside, 'utf8')).toBe('untouched')
+    expect(fs.readlinkSync(path.join(destination, 'external'))).toBe(outside)
+    expect(() => bundleHash(destination)).toThrow('Escaping bundle symlink')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
 
 test('unresolved and malformed bundle journals fence native writes without a lease', () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bundle-fence-')))

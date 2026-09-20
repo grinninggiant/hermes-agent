@@ -65,6 +65,59 @@ export function bundleHash(root: string): string {
   return hash.digest('hex')
 }
 
+/** Node 22 cpSync widens directory/link modes; restore them without following links. */
+export function copyBundle(source: string, destination: string): void {
+  fs.cpSync(source, destination, {
+    recursive: true,
+    dereference: false,
+    verbatimSymlinks: true,
+    errorOnExist: true,
+    force: false
+  })
+
+  const modes = (from: string, to: string) => {
+    const original = fs.lstatSync(from)
+    const copied = fs.lstatSync(to)
+
+    if (original.isSymbolicLink()) {
+      if (!copied.isSymbolicLink()) {
+        throw new Error('Copied bundle type mismatch')
+      }
+
+      fs.lchmodSync(to, original.mode & 0o7777)
+    } else {
+      if (original.isDirectory()) {
+        if (!copied.isDirectory() || copied.isSymbolicLink()) {
+          throw new Error('Copied bundle type mismatch')
+        }
+
+        for (const child of fs.readdirSync(from)) {
+          modes(path.join(from, child), path.join(to, child))
+        }
+      } else if (!original.isFile() || !copied.isFile() || copied.isSymbolicLink()) {
+        throw new Error('Copied bundle type mismatch')
+      }
+
+      // Post-order: do not restrict traversal before descendants are repaired.
+      fs.chmodSync(to, original.mode & 0o7777)
+    }
+  }
+
+  modes(source, destination)
+}
+
+/** Only structured OS diagnostics / fixed identity failures, never stderr or arbitrary messages. */
+function copyFailure(error: unknown) {
+  const value = error as NodeJS.ErrnoException & { status?: number }
+
+  return {
+    code: typeof value?.code === 'string' && /^[A-Z_0-9]+$/.test(value.code) ? value.code : undefined,
+    syscall: typeof value?.syscall === 'string' && /^[a-zA-Z0-9_]+$/.test(value.syscall) ? value.syscall : undefined,
+    status: Number.isInteger(value?.status) ? value.status : undefined,
+    detail: value?.message === 'Bundle identity mismatch' ? value.message : 'Bundle copy or verification failed'
+  }
+}
+
 function verifyBundle(app: string, commit: string): void {
   if (process.platform !== 'darwin') {
     throw new Error('macOS required')
@@ -238,8 +291,10 @@ export async function runBundleOffline(
 
       const record = (phase: string) => {
         if (phase !== 'prepared') {
-          if (!fs.lstatSync(journal).isFile() ||
-              JSON.stringify(JSON.parse(fs.readFileSync(journal, 'utf8')).binding) !== JSON.stringify(binding)) {
+          if (
+            !fs.lstatSync(journal).isFile() ||
+            JSON.stringify(JSON.parse(fs.readFileSync(journal, 'utf8')).binding) !== JSON.stringify(binding)
+          ) {
             throw new Error('Foreign bundle journal; refusing to resolve another transaction')
           }
         }
@@ -300,13 +355,7 @@ export async function runBundleOffline(
         identity(request.candidateApp, request.candidateSha256, request.candidateCommit)
         identity(request.installedApp, request.oldSha256, request.oldCommit)
         record('prepared')
-        fs.cpSync(request.candidateApp, stage, {
-          recursive: true,
-          dereference: false,
-          verbatimSymlinks: true,
-          errorOnExist: true,
-          force: false
-        })
+        copyBundle(request.candidateApp, stage)
         identity(stage, request.candidateSha256, request.candidateCommit)
         syncTree(stage)
         sync(parent)
@@ -419,8 +468,10 @@ export async function runBundleOffline(
       if (present(restore)) {
         try {
           identity(restore, request.oldSha256, request.oldCommit)
-        } catch {
-          throw new Error(`partial-restore-copy; retain ${backup}; move ${restore} to evidence before retry`)
+        } catch (error) {
+          throw new Error(
+            `partial-restore-copy; ${JSON.stringify(copyFailure(error))}; retain ${backup}; move ${restore} to evidence before retry`
+          )
         }
       }
 
@@ -484,22 +535,17 @@ export async function runBundleOffline(
           // unknown and fails closed, rather than overwriting unverified bytes.
           try {
             if (!fs.existsSync(restore)) {
-              fs.cpSync(backup, restore, {
-                recursive: true,
-                dereference: false,
-                verbatimSymlinks: true,
-                errorOnExist: true,
-                force: false
-              })
+              copyBundle(backup, restore)
               syncTree(restore)
               sync(parent)
             }
 
             identity(restore, request.oldSha256, request.oldCommit)
-          } catch {
+          } catch (error) {
             throw new Error(
               JSON.stringify({
                 status: 'blocked',
+                cause: copyFailure(error),
                 reason: 'partial-restore-copy',
                 retainedBackup: backup,
                 partialCopy: restore,
