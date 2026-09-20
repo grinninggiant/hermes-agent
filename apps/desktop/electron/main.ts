@@ -12,6 +12,7 @@ import { writeConnectionsRegistry } from './connection-registry-store'
 import { resolveConnectionRuntime } from './connection-runtime'
 import { attachProcessOwner, ownerLaunchArgs, type ProcessOwner } from './process-owner'
 import { RuntimeTransitionController, RuntimeTransitionJournal, type TransitionOwner } from './runtime-transition'
+import { startupEffects } from './startup-effects'
 
 // Native-only; never included in backend connection DTOs or renderer IPC.
 const nativeProcessOwners = new WeakMap<object, ProcessOwner>()
@@ -3207,6 +3208,10 @@ async function resolveHealedBranch(updateRoot, branch) {
 }
 
 async function checkUpdates() {
+  return startupEffects.checkForUpdates(checkUpdatesExternal)
+}
+
+async function checkUpdatesExternal() {
   const updateRoot = resolveUpdateRoot()
   let { branch } = readDesktopUpdateConfig()
   const gitDir = path.join(updateRoot, '.git')
@@ -3583,6 +3588,10 @@ function killHermesOwnedVenvDaemons(updateRoot) {
 // not a process-group leader — a POSIX negative-pgid kill would be meaningless
 // here anyway). POSIX teardown stays with the existing before-quit SIGTERM.
 function forceKillProcessTree(pid) {
+  return startupEffects.stopBackend(() => forceKillProcessTreeExternal(pid))
+}
+
+function forceKillProcessTreeExternal(pid) {
   if (!IS_WINDOWS) {
     return
   }
@@ -3691,6 +3700,10 @@ async function backendParentMatches(entry) {
 }
 
 async function stopOwnedBackend(identity) {
+  return startupEffects.stopBackend(() => stopOwnedBackendExternal(identity))
+}
+
+async function stopOwnedBackendExternal(identity) {
   const matches = await processIdentityMatches(identity, REAP_PROBE_TIMEOUT_MS)
 
   if (matches === false) {
@@ -3856,6 +3869,10 @@ function releaseBackendChild(child) {
 }
 
 function reapOrphanedBackendsOnce() {
+  return startupEffects.reapBackends(reapOrphanedBackendsExternal)
+}
+
+function reapOrphanedBackendsExternal() {
   if (!backendOrphanReapPromise) {
     backendOrphanReapPromise = backendOwnership
       .reapOrphans()
@@ -11428,6 +11445,10 @@ function resetBootProgressForReconnect() {
 }
 
 function stopBackendChild(child) {
+  return startupEffects.stopBackend(() => stopBackendChildExternal(child))
+}
+
+function stopBackendChildExternal(child) {
   stopBackendChildImpl(child, { forceKillProcessTree, isWindows: IS_WINDOWS })
 }
 
@@ -11584,6 +11605,10 @@ function profileRouteOptions(profile, request?) {
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
 async function ensureBackend(profile, opts: { spawnPriority?: LocalBackendSpawnPriority } = {}) {
+  return startupEffects.startBackend(() => ensureBackendExternal(profile, opts))
+}
+
+async function ensureBackendExternal(profile, opts: { spawnPriority?: LocalBackendSpawnPriority } = {}) {
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
   const spawnPriority = spawnPriorityFrom(opts.spawnPriority)
 
@@ -12996,6 +13021,10 @@ async function prepareProfileRenameRequest(request) {
 }
 
 async function startHermes() {
+  return startupEffects.startBackend(startHermesExternal)
+}
+
+async function startHermesExternal() {
   // Only the single-instance lock holder may reap/spawn/claim the desktop
   // backend. A lock-losing instance must stay inert even if some path reaches
   // here (e.g. the deferred-quit window before `ready`): its reapOrphans()
@@ -18128,7 +18157,7 @@ app.on('open-url', (event, url) => {
 app.whenReady().then(() => {
   // Warm the login-shell PATH resolution immediately so it usually completes
   // before the backend start path awaits the same single-flight promise.
-  void ensureLoginShellPath()
+  startupEffects.warmShell(() => void ensureLoginShellPath())
 
   const systemCa = installWindowsSystemCaTrust(tls)
 
@@ -18167,7 +18196,7 @@ app.whenReady().then(() => {
   registerMediaProtocol()
   installEmbedReferer()
   installRemoteHeaderRules()
-  registerDeepLinkProtocol()
+  startupEffects.registerProtocol(registerDeepLinkProtocol)
 
   ensureWslWindowsFonts()
   configureSpellChecker()
@@ -18183,7 +18212,7 @@ app.whenReady().then(() => {
   // Quick Entry's global chord — registered on ready so a cold launch restores
   // it without the renderer visiting Settings. A failed registration is logged
   // here and surfaced in Settings via the IPC state (never silent).
-  applyQuickEntrySettings(readQuickEntrySettings())
+  startupEffects.integrateDesktop(() => applyQuickEntrySettings(readQuickEntrySettings()))
 
   if (IS_MAC) {
     const reposition = () => wakeIndicatorController.reposition()
@@ -18199,7 +18228,7 @@ app.whenReady().then(() => {
   // serves were drained. The owner-only recovery journal survives that crash;
   // its worker waits for the install marker to clear, then reopens every scope
   // captured by the original transaction before removing the journal entry.
-  void resumeManagedSshRecoveries()
+  startupEffects.recoverStartup(() => void resumeManagedSshRecoveries())
   createWindow()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
