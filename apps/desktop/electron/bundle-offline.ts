@@ -12,7 +12,7 @@ import { runOfflineLocked, withOfflineMaintenance } from './runtime-offline'
 import { RuntimeTransitionJournal } from './runtime-transition'
 
 export interface BundleRequest {
-  action: 'install' | 'recover'
+  action: 'install' | 'recover' | 'archive-recovered'
   userData: string
   installedApp: string
   candidateApp: string
@@ -177,6 +177,122 @@ function canonical(file: string, exists = true) {
   }
 }
 
+/** A hard link publishes exact bytes without overwrite or a partial-copy window.
+ * Only the same inode can resume the link-before-unlink crash window.
+ */
+async function archiveRecoveredBundle(
+  request: BundleRequest,
+  expected: RuntimeSelection,
+  target: RuntimeSelection,
+  check: () => Promise<void>,
+  phase?: (phase: string) => void
+) {
+  const binding = { ...request, action: 'install' }
+  const digest = createHash('sha256').update(JSON.stringify(binding)).digest('hex')
+  const journal = path.join(request.userData, 'bundle-install.json')
+  const archive = path.join(request.userData, `bundle-install.${request.transaction}.${digest}.recovered.json`)
+
+  const read = (file: string) => {
+    let stat: fs.Stats
+
+    try {
+      stat = fs.lstatSync(file)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return undefined
+      }
+
+      throw error
+    }
+
+    if (!stat.isFile()) {
+      throw new Error('Unsafe archive/journal path')
+    }
+
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+
+    try {
+      const opened = fs.fstatSync(fd)
+
+      if (opened.dev !== stat.dev || opened.ino !== stat.ino) {
+        throw new Error('Archive/journal changed')
+      }
+
+      return { stat: opened, bytes: fs.readFileSync(fd) }
+    } finally {
+      fs.closeSync(fd)
+    }
+  }
+
+  const original = read(journal)
+  const retained = read(archive)
+  const source = original ?? retained
+
+  if (!source) {
+    throw new Error('Missing recovered bundle journal and archive')
+  }
+
+  const value = JSON.parse(source.bytes.toString('utf8'))
+
+  if (
+    value?.version !== 1 ||
+    Object.keys(value).sort().join() !== 'before,binding,phase,target,version' ||
+    value.phase !== 'recovered' ||
+    JSON.stringify(value.binding) !== JSON.stringify(binding) ||
+    JSON.stringify(value.before) !== JSON.stringify(expected) ||
+    JSON.stringify(value.target) !== JSON.stringify(target)
+  ) {
+    throw new Error('Exact recovered bundle journal required')
+  }
+
+  const unchanged = (entry: ReturnType<typeof read>) =>
+    entry &&
+    entry.stat.dev === source.stat.dev &&
+    entry.stat.ino === source.stat.ino &&
+    entry.bytes.equals(source.bytes)
+
+  const validateLayout = (requireArchive = false) => {
+    const live = read(journal)
+    const saved = read(archive)
+    const links = live && saved ? 2 : 1
+
+    if (
+      (original ? !unchanged(live) : !!live) ||
+      (saved && !unchanged(saved)) ||
+      (requireArchive && !saved) ||
+      (!live && !saved) ||
+      [live, saved].some(entry => entry && entry.stat.nlink !== links)
+    ) {
+      throw new Error('Occupied archive destination or changed bundle journal')
+    }
+  }
+
+  await check()
+  validateLayout()
+
+  if (original && !retained) {
+    // link(2) is exclusive even against dangling symlinks; rename could overwrite.
+    sync(journal)
+    fs.linkSync(journal, archive)
+    phase?.('archive-linked')
+  }
+
+  sync(archive)
+  sync(request.userData)
+  phase?.('archive-durable')
+  await check()
+  validateLayout(true)
+
+  if (original) {
+    fs.unlinkSync(journal)
+    phase?.('archive-unlinked')
+  }
+
+  sync(request.userData)
+
+  return { phase: 'archived-recovered', archive }
+}
+
 /** Ordered, recoverable publication; not atomic across bundle and registry. */
 export async function runBundleOffline(
   request: BundleRequest,
@@ -205,7 +321,7 @@ export async function runBundleOffline(
       .filter(key => key !== 'runtimeCandidate')
       .sort()
       .join() !== fields.sort().join() ||
-    !['install', 'recover'].includes(request.action) ||
+    !['install', 'recover', 'archive-recovered'].includes(request.action) ||
     !/^[a-zA-Z0-9-]{1,80}$/.test(request.transaction) ||
     ![request.oldSha256, request.candidateSha256].every(v => /^[a-f0-9]{64}$/.test(v)) ||
     ![request.oldCommit, request.candidateCommit].every(v => /^[a-f0-9]{40}$/.test(v))
@@ -266,6 +382,35 @@ export async function runBundleOffline(
       const restored = request.runtimeCandidate
         ? normalizeRuntimeSelection({ generation: expected.generation + 2, coordinate: expected.coordinate })
         : expected
+
+      if (request.action === 'archive-recovered') {
+        return archiveRecoveredBundle(
+          request,
+          expected,
+          target,
+          async () => {
+            await absent()
+
+            if (![expected, restored].some(selection => same(current(), selection))) {
+              throw new Error('stale recovered runtime generation/coordinate')
+            }
+
+            for (const name of ['runtime-transition.json', 'runtime-rollback.json']) {
+              try {
+                fs.lstatSync(path.join(root, name))
+                throw new Error('Unresolved runtime journal; archive blocked')
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+                  throw error
+                }
+              }
+            }
+
+            identity(request.installedApp, request.oldSha256, request.oldCommit)
+          },
+          boundary.phase
+        )
+      }
 
       let allowed = expected
 
