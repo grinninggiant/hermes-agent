@@ -2286,7 +2286,15 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
         custom_providers: list | None = None,
+        instruction_package_id: str | None = None,
     ):
+        from functools import partial
+        from agent.instruction_package import resolve_instruction_package
+        self._instruction_package = resolve_instruction_package(instruction_package_id)
+        if self._instruction_package is not None:
+            # Instance-local binding preserves legacy class-level callers and sibling isolation.
+            self._with_summary_prefix = partial(self._with_summary_prefix, instruction_package_id=instruction_package_id)
+            self._render_micro_marker_content = partial(self._render_micro_marker_content, instruction_package_id=instruction_package_id)
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
@@ -3541,7 +3549,8 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Drop merged prior-tail content up to the delimiter so it never leaks into the next prompt.
         if _MERGED_SUMMARY_DELIMITER in text:
             text = text.split(_MERGED_SUMMARY_DELIMITER, 1)[1].strip()
-        for prefix in (SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES):
+        from agent.instruction_package import reviewed_summary_prefixes
+        for prefix in (SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES, *reviewed_summary_prefixes(SUMMARY_PREFIX)):
             if text.startswith(prefix):
                 text = text[len(prefix):].lstrip()
                 break
@@ -3553,15 +3562,28 @@ Write only the summary body. Do not include any preamble or prefix."""
         return text
 
     @classmethod
-    def _with_summary_prefix(cls, summary: str) -> str:
+    def _with_summary_prefix(cls, summary: str, *, instruction_package_id: str | None = None) -> str:
         """Normalize summary text to the current compaction handoff format."""
         text = cls._strip_summary_prefix(summary)
-        return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
+        from agent.instruction_package import resolve_instruction_package
+        package = resolve_instruction_package(instruction_package_id)
+        prefix = package.summary_prefix(SUMMARY_PREFIX) if package else SUMMARY_PREFIX
+        return f"{prefix}\n{text}" if text else prefix
+
+    @staticmethod
+    def _render_micro_marker_content(summary_text: str, *, instruction_package_id: str | None = None) -> str:
+        from agent.instruction_package import resolve_instruction_package
+        content = MicroCompactionMixin._render_micro_marker_content(summary_text)
+        package = resolve_instruction_package(instruction_package_id)
+        if package is None:
+            return content
+        return package.summary_prefix(SUMMARY_PREFIX) + content[len(SUMMARY_PREFIX):]
 
     @staticmethod
     def _starts_with_summary_prefix(text: str) -> bool:
         """Return True if *text* begins with any known handoff prefix."""
-        return text.startswith((SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES))
+        from agent.instruction_package import reviewed_summary_prefixes
+        return text.startswith((SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES, *reviewed_summary_prefixes(SUMMARY_PREFIX)))
 
     @classmethod
     def classify_summary_content(cls, content: Any) -> Optional[str]:

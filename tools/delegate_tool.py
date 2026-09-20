@@ -176,10 +176,14 @@ def _build_child_agent(
     routing_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    acceptance_idle_seconds: Optional[float] = None,
+    instruction_package_id: Optional[str] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
     import uuid as _uuid
+    from tools.delegate_tool_acceptance import AcceptanceWindow
+    acceptance = AcceptanceWindow(acceptance_idle_seconds) if acceptance_idle_seconds is not None else None
     from run_agent import AIAgent
     from agent.delegation_context import delegated_child_context
     # Role is depth-derived: a child may delegate iff the kill switch is on and
@@ -242,6 +246,7 @@ def _build_child_agent(
                 ),
                 session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
                 tool_progress_callback=child_progress_cb,
+                instruction_package_id=instruction_package_id,
                 iteration_budget=None,  # fresh budget per subagent
             )
         except BaseException:
@@ -252,6 +257,8 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    if acceptance is not None:
+        child._delegate_acceptance = acceptance
     _apply_child_cache_ttl(child)
     if child_session_db is not None:
         child._owns_session_db = True  # released by the child's close(), never by the parent
@@ -360,7 +367,7 @@ def _run_single_child(
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
-    live_deleg_id: Optional[str], live_writers: list,
+    live_deleg_id: Optional[str], live_writers: list, commissioning=None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -386,6 +393,8 @@ def _build_children(
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                **({"instruction_package_id": commissioning[0][i],
+                    "acceptance_idle_seconds": commissioning[1]} if commissioning else {}),
             )
         except ValueError as exc:
             return [], str(exc)
@@ -412,6 +421,7 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, action: Optional[str] = None, subagent_id: Optional[str] = None,
     message: Optional[str] = None, parent_agent=None, credentials_cfg: Optional[Dict[str, Any]] = None,
+    *, _commissioning=None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -473,6 +483,14 @@ def delegate_task(
     if err:
         return tool_error(err)
 
+    if _commissioning is not None:
+        from tools.delegate_tool_commissioning import validate_commissioning
+        ids, seconds = _commissioning
+        ids = validate_commissioning(ids, seconds, max_children)
+        if len(ids) != len(task_list):
+            raise ValueError("Commissioning package/task batch mismatch")
+        _commissioning = (ids, seconds)
+
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
     # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
@@ -486,6 +504,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers,
+        commissioning=_commissioning,
     )
     if err:
         return tool_error(err)

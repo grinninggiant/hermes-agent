@@ -55,6 +55,77 @@ def _format_live_review_output(sid: str, session: Optional[dict], arg: str) -> s
     return format_dispatch_note(result, arg or "")
 
 
+def _format_live_commission_output(sid: str, session: dict, arg: str) -> str:
+    """Explicit host opt-in on the existing slash RPC pool, never a detached worker.
+
+    The public sid selects a record; only the bound transport grants authority.
+    Receipts use slash.exec's existing output delivery, not parent model history.
+    UI: type /commission run in the current chat; /commission status retrieves
+    live child IDs and the last receipt, including after a client RPC timeout.
+    No caller-supplied package, prompt, owner ID, or retention override is accepted.
+    """
+    from tools.delegate_tool_commissioning import NativeCommissioning
+    from tools.approval_context import set_current_session_key, reset_current_session_key
+
+    transport, owner = _current_session_steer_authority(sid)
+    if transport is None or owner is not session:
+        return "session not found or not owned by this transport"
+    if session.get("_closing") or _session_uses_compute_host(session):
+        return "Commissioning requires an open local native session"
+    agent = session.get("agent")
+    if agent is None:
+        return _NO_AGENT
+    parts = arg.split()
+    if not parts:
+        return "/commission run | status | compact|continue|release|stop <subagent_id>"
+    host = NativeCommissioning(agent, enabled=True)
+    action = parts[0]
+    if action == "status" and len(parts) == 1:
+        owned = {r["subagent_id"] for r in _owned_subagent_records(sid, transport, session)}
+        return json.dumps({"children": [r for r in host.snapshot() if r["subagent_id"] in owned],
+                           "receipt": session.get("_commission_receipt")})
+    if action in {"compact", "continue", "release", "stop"} and len(parts) == 2:
+        owned = _owned_subagent_records(sid, transport, session)
+        record = next((r for r in owned if r["subagent_id"] == parts[1]), None)
+        if record is None:
+            return "No retained child owned by this session generation"
+        return json.dumps(host.control(parts[1], action, expected_child=record["agent"]))
+    if parts != ["run"]:
+        return "Invalid commissioning command; use /commission for usage"
+    # Same running/history lock as prompt admission. The RPC pool thread is the
+    # owned executor, so ordinary session Stop can identify and interrupt it.
+    with _sessions_lock, session["history_lock"]:
+        current_transport_, current_owner = _current_session_steer_authority(sid)
+        if current_transport_ is None or current_owner is not session or session.get("_closing"):
+            return "session not found or not owned by this transport"
+        if session.get("running"):
+            return "session busy — wait for the current turn to finish"
+        session["running"] = True
+        session["_run_thread"] = threading.current_thread()
+    try:
+        with contextlib.ExitStack() as scope:
+            scope.callback(reset_current_session_key, set_current_session_key(session["session_key"]))
+            scope.callback(_clear_session_context, _set_session_context(session["session_key"], ui_session_id=sid))
+            scope.callback(_current_runtime_session_record.reset, _current_runtime_session_record.set(session))
+            if home := session.get("profile_home"):
+                scope.callback(reset_hermes_home_override, set_hermes_home_override(home))
+                scope.callback(reset_secret_scope, set_secret_scope(build_profile_secret_scope(Path(home))))
+                from tools.terminal_scope import install_profile_terminal_scope, reset_terminal_scope
+                scope.callback(reset_terminal_scope, install_profile_terminal_scope(Path(home)))
+            _wire_callbacks(sid)
+            session.pop("_commission_receipt", None)
+            receipt = host.run([
+                "ops239-ec8e0050-guidance", "ops239-b7013cf0-guidance"], retention_seconds=60)
+            session["_commission_receipt"] = receipt
+            return json.dumps(receipt)
+    except ValueError as exc:
+        return str(exc)
+    finally:
+        with session["history_lock"]:
+            session["running"] = False
+            session.pop("_run_thread", None)
+
+
 def _format_live_usage_output(sid: str, session: dict, arg: str) -> str:
     agent = session.get("agent")
     usage = _session_usage_snapshot(session)
@@ -201,6 +272,7 @@ _LIVE_SLASH_OUTPUT = {
                  lambda sid, session, arg: _mirror_slash_side_effects(sid, session, f"/compress {arg}".strip())),
     "usage": (_NO_AGENT_USAGE, _format_live_usage_output),
     "review": (None, _format_live_review_output),
+    "commission": (None, _format_live_commission_output),
     "history": ("No conversation history yet.", _format_live_history_output),
     "prompt": (_NO_AGENT, _format_live_prompt_output),
     "status": (None, _format_live_status_output),
