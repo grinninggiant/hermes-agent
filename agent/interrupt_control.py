@@ -117,6 +117,10 @@ class InterruptControlMixin:
         )
 
         def _publish_interrupt_state() -> None:
+            # Retained delegation spans turns; per-turn clear must not erase Stop.
+            acceptance = vars(self).get("_delegate_acceptance") if hard_cancel else None
+            if acceptance is not None:
+                acceptance.cancel()
             self._interrupt_requested = True
             self._interrupt_message = message
             self._tool_interrupt_reason = tool_interrupt_reason

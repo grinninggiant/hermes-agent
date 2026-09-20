@@ -30,11 +30,26 @@ def _num(value: Any, default: int = 0) -> int:
 def _str_or_none(value: Any) -> Optional[str]:
     return value if isinstance(value, str) else None
 
+def _instruction_package_receipt(child):
+    from agent.instruction_package import InstructionPackage
+    package = getattr(child, "_instruction_package", None)
+    if isinstance(package, InstructionPackage):
+        receipt: Dict[str, Any] = {"instruction_package": {"package_id": package.package_id, "content_sha256": package.content_sha256}}
+        # Capture the exact native handle before teardown; commissioning must not
+        # rediscover children by searching persisted prompts or recent sessions.
+        session_id = getattr(child, "session_id", None)
+        if isinstance(session_id, str) and session_id:
+            receipt["native_child_session_id"] = session_id
+        return receipt
+    return {}
+
+
 def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: float = 0) -> Dict[str, Any]:
     """Result entry for a child that raised, never finished, or was abandoned."""
     return {
         "task_index": idx, "status": status, "summary": None, "error": error, "api_calls": 0,
         "duration_seconds": duration, "_child_role": getattr(child, "_delegate_role", None),
+        **_instruction_package_receipt(child),
     }
 
 def _append_missed_steer(entry: Dict[str, Any], late_steer: Optional[str]) -> None:
@@ -511,6 +526,9 @@ def _build_result_entry(
     # Model-visible per-delegation spend (unlike _child_cost_usd above).
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"
+    entry.update(_instruction_package_receipt(child))
+    if "acceptance" in result:
+        entry["acceptance"] = result["acceptance"]
     if status == "failed":
         if schema.valid is False and usable_summary:
             # The child DID respond; name the contract violation instead of the generic "no response" error.
@@ -656,9 +674,12 @@ class _ChildRun:
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
+                result = child.run_conversation(
                     user_message=self.goal, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )
+                from tools.delegate_tool_acceptance import AcceptanceWindow
+                acceptance = getattr(child, "_delegate_acceptance", None)
+                return acceptance.run(self, result) if isinstance(acceptance, AcceptanceWindow) else result
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
         try:
@@ -713,6 +734,7 @@ class _ChildRun:
             "timeout_phase": "before_first_llm_call" if before_first_call else "after_llm_calls" if is_timeout else None,
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
+            **_instruction_package_receipt(child),
         }
         self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
         close_deferred = is_timeout and not future.done()

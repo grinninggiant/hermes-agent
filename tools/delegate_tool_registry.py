@@ -190,7 +190,8 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
 
 # Model-facing control actions accepted by delegate_task(action=...).
 # "spawn" (or omitted) keeps the historical spawn semantics.
-_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+_ACCEPTANCE_ACTIONS = frozenset({"compact", "continue", "release"})
+_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"}) | _ACCEPTANCE_ACTIONS
 
 def _resolve_session_lineage(session_id: Optional[str], parent_agent: Any) -> str:
     """Tip of a session id's compression lineage via the parent's live SessionDB (best-effort; input unchanged when
@@ -247,6 +248,10 @@ def _list_payload(parent_agent: Any) -> Dict[str, Any]:
             "accepting_steer": bool(r.get("accepting_steer", False)),
             "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
         })
+        from tools.delegate_tool_acceptance import AcceptanceWindow
+        acceptance = getattr(r.get("agent"), "_delegate_acceptance", None)
+        if isinstance(acceptance, AcceptanceWindow):
+            entries[-1]["acceptance"] = acceptance.snapshot()
     payload: Dict[str, Any] = {"action": "list", "count": len(entries), "subagents": entries}
     if not entries:
         payload["note"] = (
@@ -274,6 +279,12 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
             "may have already finished (its result arrives as a normal "
             "completion message). Use action='list' to see live children."
         )
+    if action in _ACCEPTANCE_ACTIONS:
+        from tools.delegate_tool_acceptance import AcceptanceWindow
+        acceptance = getattr(record["agent"], "_delegate_acceptance", None)
+        if not isinstance(acceptance, AcceptanceWindow):
+            return tool_error("This child did not opt in to an acceptance window.")
+        return json.dumps(acceptance.request(action, message, record["agent"]))
     if action == "steer" and not (message or "").strip():
         return tool_error("action='steer' requires a non-empty 'message' describing the course correction.")
     outcome = _CONTROL_OUTCOMES.get(action)
