@@ -89,7 +89,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             session["_auto_continue_scheduled"] = False
             return
         with session["history_lock"]:
-            if session.get("running") or session.get("_turn_cancel_requested") or session.get("_finalized"):
+            if session.get("_runtime_quiescence") or _process_admission_closed() or session.get("running") or session.get("_turn_cancel_requested") or session.get("_finalized"):
                 session["_auto_continue_scheduled"] = False  # a real user prompt beat us; it clears the marker
                 return
             session["running"] = True
@@ -282,7 +282,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     """Fire a queued next-turn prompt if one is waiting and the session is idle. True when dispatched: the caller
     skips lower-priority follow-ups this cycle (the user's message wins)."""
     with session["history_lock"]:
-        if session.get("_closing") or not (queued := session.get("queued_prompt")) or session.get("running"):
+        if session.get("_runtime_quiescence") or _process_admission_closed() or session.get("_closing") or not (queued := session.get("queued_prompt")) or session.get("running"):
             return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         _ac_set_queue(session, session.get("queued_prompts") or [])

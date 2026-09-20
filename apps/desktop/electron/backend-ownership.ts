@@ -312,6 +312,17 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
 }
 
 export function backendCommandMatches(command: unknown): boolean {
+  // The private bootstrap is only launched directly by Python for explicit General.
+  // Anchor at the executable: a script, -c payload or argv mention is not ownership.
+  if (
+    typeof command === 'string' &&
+    /^(?:"(?:[^"\r\n]*[/\\])?python(?:3(?:\.\d+)?)?(?:\.exe)?"|(?:[^\s"\r\n]*[/\\])?python(?:3(?:\.\d+)?)?(?:\.exe)?)\s+-m\s+tui_gateway\.owner_bootstrap\s+--profile\s+general\s+serve(?:\s|$)/.test(
+      command
+    )
+  ) {
+    return true
+  }
+
   return /(?:^|[\s/\\"])(?:hermes(?:\.exe)?|hermes_cli\.main|hermes_cli[/\\]main\.py)"?(?:\s+(?:--profile|-p)\s+\S+)?\s+(?:serve|dashboard)(?:\s|$)/i.test(
     String(command ?? '')
   )

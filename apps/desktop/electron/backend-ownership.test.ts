@@ -309,6 +309,59 @@ test('backend identity check matches only serve and dashboard invocation shapes'
   assert.equal(backendCommandMatches('unrelated dashboard'), false)
 })
 
+test('owner bootstrap is an exact Python invocation and reaper retains failed cleanup for retry', async () => {
+  const command = '/runtime/bin/python3 -m tui_gateway.owner_bootstrap --profile general serve --port 0'
+  const entry = { ...ownershipEntry({ profile: 'general' }), command }
+  const store = memoryStore(stored([entry]))
+  let parentAlive = true
+  let stopFails = true
+
+  const stop = vi.fn(() => {
+    if (stopFails) {
+      throw new Error('retry')
+    }
+  })
+
+  const ownership = createOwnership(store, {
+    matchesParent: async () => parentAlive,
+    matchesIdentity: async () => backendCommandMatches(command),
+    stop
+  })
+
+  await ownership.reapOrphans()
+  assert.deepEqual(parseBackendOwnership(store.value()), [entry])
+  assert.equal(stop.mock.calls.length, 0)
+  parentAlive = false
+  await ownership.reapOrphans()
+  assert.deepEqual(parseBackendOwnership(store.value()), [entry])
+  stopFails = false
+  assert.deepEqual(await ownership.reapOrphans(), [entry.pid])
+  assert.deepEqual(parseBackendOwnership(store.value()), [])
+  assert.deepEqual(stop.mock.calls, [[entry], [entry]])
+
+  for (const candidate of [
+    command,
+    '"/Runtime Space/python3.13" -m tui_gateway.owner_bootstrap --profile general serve'
+  ]) {
+    assert.equal(backendCommandMatches(candidate), true)
+  }
+
+  for (const candidate of [
+    'echo ' + command,
+    'python3 -c "' + command + '"',
+    command.replace('general', 'other'),
+    command.replace('--profile general ', ''),
+    command.replace('serve', 'dashboard'),
+    command.replace('serve', 'serve-evil'),
+    command.replace('owner_bootstrap', 'owner_bootstrap_evil'),
+    command.replace('python3', 'notpython3'),
+    command.replace('-m', '-c'),
+    command.replace('--profile', '-p')
+  ]) {
+    assert.equal(backendCommandMatches(candidate), false, candidate)
+  }
+})
+
 test('shutdown coordinator returns one promise and awaits teardown exactly once', async () => {
   const completion = deferred()
   const teardown = vi.fn(() => completion.promise)

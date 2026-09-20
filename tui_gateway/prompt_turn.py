@@ -383,7 +383,7 @@ def _run_post_turn_followups(
         return
     if goal_followup:
         with session["history_lock"]:
-            if session.get("running"):
+            if session.get("_runtime_quiescence") or _process_admission_closed() or session.get("running"):
                 return  # user already sent something — their turn wins
             session["running"] = True
         _dispatch_followup_turn(rid, sid, session, goal_followup, "goal continuation dispatch")

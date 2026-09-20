@@ -282,6 +282,10 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 
+from hermes_cli.web_server_admission import ProcessAdmissionMiddleware
+
+app.add_middleware(ProcessAdmissionMiddleware)
+
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402

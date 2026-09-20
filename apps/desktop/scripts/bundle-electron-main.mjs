@@ -63,3 +63,14 @@ await build({
   logLevel: 'info',
 })
 console.log(`bundled ${preloadOut}${isDev ? ' (dev)' : ''}`)
+
+// Offline maintenance must ship independently of Electron startup and tsx.
+await build({
+  entryPoints: [resolve(root, 'scripts/runtime-offline.ts')],
+  bundle: true,
+  platform: 'node',
+  format: 'esm',
+  target: 'node20',
+  outfile: resolve(distDir, 'runtime-offline.mjs'),
+  logLevel: 'info',
+})

@@ -127,6 +127,8 @@ def _notif_release_turn(session: dict) -> None:
 def _notif_claim_turn(session: dict) -> bool:
     """Claim the idle session (running=True) under history_lock; False if a turn is live."""
     with session["history_lock"]:
+        if session.get("_runtime_quiescence") or _process_admission_closed():
+            return False
         claimed = not session.get("running")
         session["running"] = True
         return claimed
@@ -492,11 +494,12 @@ def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, 
 def _poll_bot_live_delivery_once(sid: str, session: dict) -> bool:
     """Run one durable envelope only after local FIFO/continuations yield the idle boundary."""
     from tools.bot_live_delivery import claim_pending_delivery, complete_delivery, find_canonical_live_owner
+    from tui_gateway.process_admission import is_closed as _process_admission_closed
 
     home = _session_home(session)
     with session["history_lock"]:
-        if any(session.get(key) for key in (
-                "running", "_closing", "_finalized", "queued_prompt", "queued_prompts",
+        if _process_admission_closed() or any(session.get(key) for key in (
+                "running", "_runtime_quiescence", "_closing", "_finalized", "queued_prompt", "queued_prompts",
                 "_auto_continue_scheduled")) or session.get("agent") is None:
             return False
         lease = session.get("active_session_lease")
@@ -556,47 +559,59 @@ def _notification_poller_loop(stop_event: threading.Event, sid: str, session: di
     handle = lambda events, deferred: _notif_handle_ready(  # noqa: E731
         sid, session, events, emitted, process_registry, format_process_notification, deferred)
     last_kanban_poll = last_loop_poll = 0.0
+    from tui_gateway import process_admission
     while not stop_event.is_set() and not session.get("_finalized"):
-        now = time.monotonic()
-        try:
-            _poll_bot_live_delivery_once(sid, session)
-        except Exception:
-            logger.warning("Bot live-owner delivery poll failed", exc_info=True)
-        # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
-        # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
-        if now - last_loop_poll >= _LOOP_POLL_SECONDS:
-            last_loop_poll = now
-            for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick)):
-                try:
-                    fire(sid, session)
-                except Exception as tick_exc:
-                    _notif_log_failure(f"{what} poll failed", tick_exc)
-        if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
-            last_kanban_poll = now
-            _notif_poll_kanban(sid, session)
-        try:
-            evt = queue.get(timeout=0.5)
-        except Exception:
+        if not process_admission.admit():
+            stop_event.wait(0.5)
             continue
-        ready = [evt]
+        try:
+            now = time.monotonic()
+            try:
+                _poll_bot_live_delivery_once(sid, session)
+            except Exception:
+                logger.warning("Bot live-owner delivery poll failed", exc_info=True)
+            # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
+            # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
+            if now - last_loop_poll >= _LOOP_POLL_SECONDS:
+                last_loop_poll = now
+                for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick)):
+                    try:
+                        fire(sid, session)
+                    except Exception as tick_exc:
+                        _notif_log_failure(f"{what} poll failed", tick_exc)
+            if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
+                last_kanban_poll = now
+                _notif_poll_kanban(sid, session)
+            try:
+                evt = queue.get(timeout=0.5)
+            except Exception:
+                continue
+            ready = [evt]
+            for _ in range(queue.qsize()):
+                try:
+                    ready.append(queue.get_nowait())
+                except Exception:
+                    break
+            handle(ready, None)
+        finally:
+            process_admission.release()
+    # Drain remaining events after the stop signal so nothing is lost on shutdown; foreign and orphaned-delegation
+    # events are handed back to the shared queue afterwards.
+    if not process_admission.admit():
+        return  # Keep pending events queued; never consume them behind the fence.
+    try:
+        deferred: list = []
+        ready = []
         for _ in range(queue.qsize()):
             try:
                 ready.append(queue.get_nowait())
             except Exception:
                 break
-        handle(ready, None)
-    # Drain remaining events after the stop signal so nothing is lost on shutdown; foreign and orphaned-delegation
-    # events are handed back to the shared queue afterwards.
-    deferred: list = []
-    ready = []
-    for _ in range(queue.qsize()):
-        try:
-            ready.append(queue.get_nowait())
-        except Exception:
-            break
-    handle(ready, deferred)
-    for evt in deferred:
-        queue.put(evt)
+        handle(ready, deferred)
+        for evt in deferred:
+            queue.put(evt)
+    finally:
+        process_admission.release()
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:
