@@ -67,7 +67,19 @@ The DOM assertion requires a complete, mounted document, the visible exact
 `Hermes couldn't start` heading, and exactly the expected `hermes:connection`
 backend-unavailable error within that heading's recovery overlay. It does not
 mistake the offline badge, hidden SVG icons, or another overlay's errors for the
-recovery error.
+recovery error. The check uses the actual text line rectangles (not a rounded
+panel's unpainted corners), ancestor opacity/visibility, viewport bounds and
+foreground hit tests. It brackets each screenshot with DOM observations across
+paint frames and requires two identical PNG captures with identical accepted
+DOM/geometry. A stuck overlay, fading text, or changing capture fails closed;
+the fixture never clicks or hides an overlay to obtain success.
+
+`renderer-capture` records before/after DOM, text geometry, alignment, attempt
+count and the SHA-256 of the exact saved PNG. Inspect that PNG as well: a DOM
+presence check alone previously accepted a stale `Starting Hermes…` frame. The
+bounded wait has at most 40 attempts and remains subject to the 30-second
+quit-only fallback. Unit tests simulate layout/compositor boundaries; actual
+Electron captures provide the separate visual evidence.
 
 ## Negative Electron probes
 

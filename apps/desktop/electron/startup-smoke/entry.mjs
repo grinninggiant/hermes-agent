@@ -1,6 +1,6 @@
 // Disposable test entry only; never a production launch option.
 import { app, session, globalShortcut, utilityProcess, shell, net as electronNet } from 'electron'
-import { installGuards, nodePty, requestDecision, requestExpected, recoveryAccepted } from './guards.mjs'
+import { installGuards, nodePty, requestDecision, requestExpected, recoveryAccepted, captureRecovery } from './guards.mjs'
 import * as ptyNamespace from './guards.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -10,6 +10,7 @@ import https from 'node:https'
 import net from 'node:net'
 import tls from 'node:tls'
 import { syncBuiltinESMExports } from 'node:module'
+import { createHash } from 'node:crypto'
 
 const root = path.dirname(app.getAppPath())
 const trace = (event, details = {}) => {
@@ -51,26 +52,17 @@ app.on('browser-window-created', (_event, window) => {
     nodeIntegration: preferences.nodeIntegration })
   window.webContents.once('did-finish-load', async () => {
     try {
-      await new Promise(resolve => setTimeout(resolve, 1000))
       if (process.argv.includes('--probe-network')) {
         // Reserved invalid name, no service to contact; onBeforeRequest must cancel first.
         await window.webContents.executeJavaScript(`fetch('https://unexpected.invalid/startup-smoke-probe').catch(() => null)`)
       }
-      const dom = await window.webContents.executeJavaScript(`(() => {
-        const visible = e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
-        const heading = [...document.querySelectorAll('h2')].find(e => visible(e) && e.textContent.trim() === "Hermes couldn't start");
-        const recovery = heading?.closest('[data-glass-opaque]');
-        return {
-          url: location.href, readyState: document.readyState,
-          rootChildren: document.getElementById('root')?.childElementCount ?? 0,
-          headings: recovery ? [heading.textContent.trim()] : [],
-          errors: [...(recovery?.querySelectorAll('.text-destructive') ?? [])].filter(visible).map(e => e.textContent.trim()).filter(Boolean),
-          nodeUnavailable: typeof require === 'undefined' && typeof process === 'undefined'
-        };
-      })()`)
+      const { before, dom, png, aligned, attempts } = await captureRecovery(window.webContents)
+      fs.writeFileSync(path.join(root, 'renderer.png'), png)
+      trace('renderer-capture', { before, after: dom, aligned, attempts,
+        stableCaptures: aligned ? 2 : 0, screenshot: 'renderer.png', sha256: createHash('sha256').update(png).digest('hex') })
       trace('renderer-loaded', dom)
-      fs.writeFileSync(path.join(root, 'renderer.png'), (await window.webContents.capturePage()).toPNG())
-      passed = recoveryAccepted(dom) && dom.nodeUnavailable && preferences.sandbox === true &&
+      if (!aligned) trace('renderer-unsettled', { reason: 'No stable, unoccluded recovery capture within bounded wait' })
+      passed = aligned && recoveryAccepted(dom) && dom.nodeUnavailable && preferences.sandbox === true &&
         preferences.contextIsolation === true && preferences.nodeIntegration === false && violations === 0
     } catch (error) {
       trace('renderer-error', { message: error.message })
