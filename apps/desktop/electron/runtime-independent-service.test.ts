@@ -15,7 +15,46 @@ const target = `gui/${process.getuid?.()}/ai.hermes.serve-general`
 const job = `${target} = {\n\tpath = ${home}/Library/LaunchAgents/ai.hermes.serve-general.plist\n\ttype = LaunchAgent\n\tstate = running\n\tprogram = ${home}/.hermes/scripts/hermes-serve-keychain.sh\n\truns = 19\n\tpid = ${row.pid}\n}`
 const snapshot = `Wed Sep 16 16:14:21 2026 ${command}`
 
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs() })
+
+const realExecText = claim.execText
+
+test.skipIf(process.platform !== 'darwin')('external Terminal locales preserve SDK identity using real macOS start-time reads', async () => {
+  for (const locale of ['C', 'tr_TR.UTF-8', 'de_DE.UTF-8']) {
+    vi.restoreAllMocks()
+    vi.stubEnv('LANG', locale)
+    vi.stubEnv('LC_ALL', locale)
+    vi.stubEnv('LC_TIME', locale)
+    const osRead = boundary()
+    // Only job/launcher/argv are fixtures. Exercise the actual ps date formatter
+    // and execText environment propagation, without launching a service.
+    osRead.mockImplementation(async (file, args, options) => {
+      if (file === '/bin/launchctl') {return job}
+
+      if (file === '/bin/ps' && args.includes('comm=')) {return python}
+
+      if (file === '/bin/ps') {
+        const start = await realExecText('/bin/ps', ['-p', String(process.pid), '-o', 'lstart='], options)
+
+        return `${start} ${command}`
+      }
+
+      throw new Error('unexpected OS read')
+    })
+    expect(await inspectClosedDesktop('/Applications/Hermes.app', '{"backends":[]}', async () => [row]), locale).toBe('absent')
+  }
+})
+
+test.skipIf(process.platform !== 'darwin')('denied OS identity reads remain blocking even with an exact launchd job', async () => {
+  for (const code of ['EPERM', 'EACCES']) {
+    vi.restoreAllMocks()
+    boundary().mockImplementation(async file => {
+      if (file === '/bin/launchctl') {return job}
+      throw Object.assign(new Error('fixture permission denied'), { code })
+    })
+    expect(await inspectClosedDesktop('/Applications/Hermes.app', '{"backends":[]}', async () => [row])).toBe('alive')
+  }
+})
 
 function boundary(jobs = [job, job], snapshots = [snapshot, snapshot], executables = [python, python]) {
   const read = fs.readFileSync.bind(fs)

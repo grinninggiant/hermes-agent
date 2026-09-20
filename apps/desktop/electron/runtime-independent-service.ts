@@ -53,7 +53,12 @@ export async function isIndependentGeneralService(row: { pid: number; command: s
   }
 
   const readProcess = async (python: string) => {
-    const text = await execText('/bin/ps', ['-ww', '-p', String(row.pid), '-o', 'lstart=,command='], { timeout: 5000 })
+    // lstart is locale-formatted (e.g. Turkish puts day before month).
+    // Pin only this subprocess to the parser's format; identity checks stay exact.
+    const text = await execText('/bin/ps', ['-ww', '-p', String(row.pid), '-o', 'lstart=,command='], {
+      timeout: 5000, env: { ...process.env, LC_ALL: 'C' }
+    })
+
     // macOS truncates comm when it is not the last column, even with -ww.
     const executable = await execText('/bin/ps', ['-ww', '-p', String(row.pid), '-o', 'comm='], { timeout: 5000 })
     const match = /^(\w{3} \w{3}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4})\s+(.+)$/.exec(text)
