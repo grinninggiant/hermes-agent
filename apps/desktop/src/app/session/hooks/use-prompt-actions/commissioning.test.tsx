@@ -12,7 +12,9 @@ it('routes typed commissioning and timeout recovery through the real desktop sla
     if (method === 'slash.exec' && command === 'commission run') {
       throw new Error('request timed out after 30s: slash.exec')
     }
-    if (method === 'command.dispatch') throw new Error('not a quick/plugin/skill command')
+    if (method === 'command.dispatch') {
+      throw new Error('not a quick/plugin/skill command')
+    }
     return { output: JSON.stringify({ children: [], receipt }) }
   })
   const appendSessionTextMessage = vi.fn()

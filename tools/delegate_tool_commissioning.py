@@ -57,7 +57,7 @@ _CONTINUATION = (
 def _write_artifact(path, value):
     # Exclusive creation prevents reuse/overwrite and makes the retained result owner-only.
     import os
-    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as stream:
         json.dump(value, stream, sort_keys=True, indent=2)
 
 
@@ -169,6 +169,8 @@ class NativeCommissioning:
         with _active_subagents_lock:
             for record in _active_subagents.values():
                 child = record.get("agent")
+                if child is None:
+                    continue
                 parent_ref = getattr(child, "_delegate_parent_ref", None)
                 package = getattr(child, "_instruction_package", None)
                 acceptance = getattr(child, "_delegate_acceptance", None)
