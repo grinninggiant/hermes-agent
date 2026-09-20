@@ -8,7 +8,7 @@ import path from 'node:path'
 import tls from 'node:tls'
 
 import { parseStoredRegistry } from './connection-registry'
-import { writeConnectionsRegistry } from './connection-registry-store'
+import { assertBundleReady, writeConnectionsRegistry } from './connection-registry-store'
 import { resolveConnectionRuntime } from './connection-runtime'
 import { attachProcessOwner, ownerLaunchArgs, type ProcessOwner } from './process-owner'
 import { RuntimeTransitionController, RuntimeTransitionJournal, type TransitionOwner } from './runtime-transition'
@@ -894,6 +894,7 @@ const nativeRuntimeTransition = new RuntimeTransitionController({
   store: {
     read: () => {
       assertNoOfflineMaintenance()
+      assertBundleReady(app.getPath('userData'))
 
       try {
         return parseStoredRegistry(fs.readFileSync(DESKTOP_CONNECTIONS_REGISTRY_PATH, 'utf8'))
@@ -5062,6 +5063,7 @@ function createActiveBackend(backendArgs) {
 function resolveHermesBackend(backendArgs, runtimeProfile?: string) {
   // Only local serve callers opt in; CLI helpers and gateway resolution stay unchanged.
   if (runtimeProfile === 'general') {
+    assertBundleReady(app.getPath('userData'))
     const registry = readDesktopConnectionsRegistry()
     const selected = registry.connections.find(c => c.id === 'local')?.generalRuntime?.coordinate
 
@@ -9678,6 +9680,7 @@ function assertNoOfflineMaintenance() {
 
 function writeDesktopConnectionsRegistry(registry) {
   assertNoOfflineMaintenance()
+  assertBundleReady(app.getPath('userData'))
   fs.mkdirSync(path.dirname(DESKTOP_CONNECTIONS_REGISTRY_PATH), { recursive: true })
   // Owner-only for the same reason as connection.json: entries carry
   // safeStorage-encrypted tokens plus URLs and SSH host/user/keyPath.

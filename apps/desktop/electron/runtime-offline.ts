@@ -89,9 +89,13 @@ export async function inspectClosedDesktop(
     // Unknown/unowned serve remains blocking unless the exact independent
     // General service supplies fresh, stable job + incarnation evidence.
     for (const row of processes.filter(p => backendCommandMatches(p.command))) {
-      if (parsed.entries.some(entry => entry.pid === row.pid || entry.parentPid === row.pid)) {return 'alive'}
+      if (parsed.entries.some(entry => entry.pid === row.pid || entry.parentPid === row.pid)) {
+        return 'alive'
+      }
 
-      if (!(await isIndependentGeneralService(row))) {return 'alive'}
+      if (!(await isIndependentGeneralService(row))) {
+        return 'alive'
+      }
     }
 
     return 'absent'
@@ -127,9 +131,26 @@ export async function runOffline(
     throw new Error('Absolute paths required')
   }
 
-  const expected = normalizeRuntimeSelection(request.expected)
+  return withOfflineMaintenance(
+    request,
+    async (root, assertAbsent) => {
+      return runOfflineLocked(request, pins, root, assertAbsent)
+    },
+    inspect
+  )
+}
+
+/** Shared lease boundary; callbacks must not recursively acquire this lease. */
+export async function withOfflineMaintenance<T>(
+  request: { userData: string; installedApp: string },
+  operation: (root: string, assertAbsent: () => Promise<void>) => Promise<T>,
+  inspect = inspectClosedDesktop
+): Promise<T> {
+  if (!path.isAbsolute(request.userData) || !path.isAbsolute(request.installedApp)) {
+    throw new Error('Absolute paths required')
+  }
+
   const root = fs.realpathSync(request.userData)
-  const file = path.join(root, 'connections.json')
   const lock = path.join(root, 'runtime-maintenance.lock')
 
   const assertAbsent = async () => {
@@ -210,80 +231,91 @@ export async function runOffline(
   try {
     await assertAbsent()
 
-    const store = {
-      read: () => readConnectionsRegistry(file),
-      write: (r: ReturnType<typeof readConnectionsRegistry>) => writeConnectionsRegistry(file, r)
-    }
-
-    const current = normalizeRuntimeSelection(
-      store.read().connections.find(c => c.id === 'local')?.generalRuntime ?? { generation: 0, coordinate: null }
-    )
-
-    if (JSON.stringify(current) !== JSON.stringify(expected)) {
-      throw new Error('stale runtime generation/coordinate')
-    }
-
-    const trusted = new Set(pins.map(p => p.manifestSha256))
-    const pending = new RuntimeTransitionJournal(path.join(root, 'runtime-transition.json'))
-    const rollback = new RuntimeTransitionJournal(path.join(root, 'runtime-rollback.json'))
-
-    if (request.action === 'activate') {
-      if (
-        !request.candidate ||
-        !pins.some(
-          p => p.commit === request.candidate!.commit && p.manifestSha256 === request.candidate!.manifestSha256
-        )
-      ) {
-        throw new Error('Candidate pin mismatch')
-      }
-
-      validateRuntimeCoordinate(request.candidate, trusted)
-
-      if (pending.read() || rollback.read()) {
-        throw new Error('Previous transition/rollback record exists')
-      }
-    }
-
-    await assertAbsent()
-    const journal = request.action === 'rollback' && !pending.read() ? rollback : pending
-
-    const controller = new RuntimeTransitionController({
-      store,
-      journal,
-      trusted: () => trusted,
-      owner: () => null,
-      backendState: () => 'absent'
-    })
-
-    const result =
-      request.action === 'activate' ? controller.transitionClosed(expected, request.candidate!) : controller.recover()
-
-    const readback = normalizeRuntimeSelection(
-      store.read().connections.find(c => c.id === 'local')?.generalRuntime ?? { generation: 0, coordinate: null }
-    )
-
-    if (result && JSON.stringify(readback) !== JSON.stringify(result)) {
-      throw new Error('Registry readback mismatch')
-    }
-
-    if (request.action === 'activate') {
-      rollback.write(expected, result!)
-      pending.clear()
-    } else if (request.action === 'rollback' && rollback.read()) {
-      // A crash after rollback publication is completed by the same controller.
-      new RuntimeTransitionController({
-        store,
-        journal: rollback,
-        trusted: () => trusted,
-        owner: () => null,
-        backendState: () => 'absent'
-      }).recover()
-    }
-
-    return result
+    return await operation(root, assertAbsent)
   } finally {
     if (fs.readlinkSync(lock) === lease) {
       fs.unlinkSync(lock)
     }
   }
+}
+
+export async function runOfflineLocked(
+  request: OfflineRequest,
+  pins: { commit: string; manifestSha256: string }[],
+  root: string,
+  assertAbsent: () => Promise<void>,
+  ownedBinding?: string
+): Promise<RuntimeSelection | null> {
+  const file = path.join(root, 'connections.json')
+  const expected = normalizeRuntimeSelection(request.expected)
+
+  const store = {
+    read: () => readConnectionsRegistry(file),
+    write: (r: ReturnType<typeof readConnectionsRegistry>) => writeConnectionsRegistry(file, r, ownedBinding)
+  }
+
+  const current = normalizeRuntimeSelection(
+    store.read().connections.find(c => c.id === 'local')?.generalRuntime ?? { generation: 0, coordinate: null }
+  )
+
+  if (JSON.stringify(current) !== JSON.stringify(expected)) {
+    throw new Error('stale runtime generation/coordinate')
+  }
+
+  const trusted = new Set(pins.map(p => p.manifestSha256))
+  const pending = new RuntimeTransitionJournal(path.join(root, 'runtime-transition.json'))
+  const rollback = new RuntimeTransitionJournal(path.join(root, 'runtime-rollback.json'))
+
+  if (request.action === 'activate') {
+    if (
+      !request.candidate ||
+      !pins.some(p => p.commit === request.candidate!.commit && p.manifestSha256 === request.candidate!.manifestSha256)
+    ) {
+      throw new Error('Candidate pin mismatch')
+    }
+
+    validateRuntimeCoordinate(request.candidate, trusted)
+
+    if (pending.read() || rollback.read()) {
+      throw new Error('Previous transition/rollback record exists')
+    }
+  }
+
+  await assertAbsent()
+  const journal = request.action === 'rollback' && !pending.read() ? rollback : pending
+
+  const controller = new RuntimeTransitionController({
+    store,
+    journal,
+    trusted: () => trusted,
+    owner: () => null,
+    backendState: () => 'absent'
+  })
+
+  const result =
+    request.action === 'activate' ? controller.transitionClosed(expected, request.candidate!) : controller.recover()
+
+  const readback = normalizeRuntimeSelection(
+    store.read().connections.find(c => c.id === 'local')?.generalRuntime ?? { generation: 0, coordinate: null }
+  )
+
+  if (result && JSON.stringify(readback) !== JSON.stringify(result)) {
+    throw new Error('Registry readback mismatch')
+  }
+
+  if (request.action === 'activate') {
+    rollback.write(expected, result!)
+    pending.clear()
+  } else if (request.action === 'rollback' && rollback.read()) {
+    // A crash after rollback publication is completed by the same controller.
+    new RuntimeTransitionController({
+      store,
+      journal: rollback,
+      trusted: () => trusted,
+      owner: () => null,
+      backendState: () => 'absent'
+    }).recover()
+  }
+
+  return result
 }
