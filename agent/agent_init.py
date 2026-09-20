@@ -1923,6 +1923,9 @@ def _compressor_max_tokens(agent):
 
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
     _selected_engine = _select_context_engine(_agent_cfg)
+    package = getattr(agent, "_instruction_package", None)
+    if _selected_engine is not None and package is not None:
+        raise ValueError("Reviewed instruction packages require the native context compressor")
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
         # External engines own compaction policy — the host threshold (and its Codex
@@ -1962,6 +1965,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             proactive_prune_min_reclaim_tokens=cs.proactive_prune_min_reclaim,
             min_tail_user_messages=cs.min_tail_users, tail_mode=cs.tail_mode,
             custom_providers=_custom_providers,
+            instruction_package_id=package.package_id if package is not None else None,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
@@ -2353,7 +2357,12 @@ def init_agent(
     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
+    instruction_package_id: str | None = None,
 ):
+    from agent.instruction_package import resolve_instruction_package
+    if "_instruction_package" in vars(agent):
+        raise ValueError("Instruction package is already bound")
+    agent._instruction_package = resolve_instruction_package(instruction_package_id)
     _install_safe_stdio()
 
     _params = locals()

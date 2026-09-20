@@ -1262,6 +1262,7 @@ def _current_session_platform_hint() -> str:
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None, available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None, skills_dir_override: "Path | None" = None,
+    instruction_package_id: str | None = None,
 ) -> str:
     """Compact skill index for the system prompt.
 
@@ -1270,6 +1271,8 @@ def build_skills_system_prompt(
     ``skills_dir_override`` makes home resolution EXPLICIT: a build thread that never bound the HERMES_HOME
     ContextVar would otherwise leak the default profile's skills into a bot's prompt.
     """
+    from agent.instruction_package import resolve_instruction_package
+    resolve_instruction_package(instruction_package_id)
     _home_token = None
     if skills_dir_override is not None:
         skills_dir = Path(skills_dir_override)
@@ -1284,7 +1287,7 @@ def build_skills_system_prompt(
         if not skills_dir.exists() and not external_dirs and not project_dirs:
             return ""
         return _build_skills_system_prompt_inner(
-            skills_dir, external_dirs, available_tools, available_toolsets, compact_categories, project_dirs)
+            skills_dir, external_dirs, available_tools, available_toolsets, compact_categories, project_dirs, instruction_package_id)
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
@@ -1346,8 +1349,11 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
     compact_categories: "frozenset[str] | None", available_tools: "set[str] | None",
+    instruction_package_id: str | None = None,
 ) -> str:
     """Render the ## Skills block; "" when there is nothing to list."""
+    from agent.instruction_package import resolve_instruction_package
+    package = resolve_instruction_package(instruction_package_id)
     if not skills_by_category:
         return ""
     # Demoted categories collapse to one names-only line. NEVER drop entries — agent-created skills are the
@@ -1380,19 +1386,24 @@ def _render_skills_index(
         )
     return (
         "## Skills\n"
+        + (package.skills_lead.format(basic_tools=(
+            "terminal" if available_tools is not None and "web_search" not in available_tools else "web_search or terminal"
+        )) if package else (
         "Use the skill index to select guidance for the current task. Load a skill with skill_view(name) "
         "when its stated trigger matches the work you are performing; do not load it solely because it "
         "shares a topic word. Start with the matching skill's router and load only references needed "
         "for the next action. Follow applicable domain instructions and required governance; this "
         "selection rule does not relax security, approval, credential, Stop, or human-owned completion boundaries.\n"
-        "If a skill has issues, fix it with skill_manage(action='patch').\n"
+        ))
+        + "If a skill has issues, fix it with skill_manage(action='patch').\n"
         "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
         "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
         "\n"
         "<available_skills>\n"
         + "\n".join(index_lines) + "\n"
         "</available_skills>\n\n"
-        "If no skill trigger matches, proceed with the available tools. Reassess skill selection when task scope changes."
+        + (package.skills_tail if package else
+           "If no skill trigger matches, proceed with the available tools. Reassess skill selection when task scope changes.")
         + hidden_note
     )
 
@@ -1406,6 +1417,7 @@ def _build_skills_system_prompt_inner(
     skills_dir: "Path", external_dirs: "list[Path]", available_tools: "set[str] | None",
     available_toolsets: "set[str] | None", compact_categories: "frozenset[str] | None",
     project_dirs: "list[Path] | None" = None,
+    instruction_package_id: str | None = None,
 ) -> str:
     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
     _platform_hint = _current_session_platform_hint()
@@ -1416,7 +1428,7 @@ def _build_skills_system_prompt_inner(
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
-        _oneshot_prompt_variant(),
+        _oneshot_prompt_variant(), instruction_package_id,
     )
     snapshot = _load_skills_snapshot(skills_dir)
     app_gated = snapshot is not None and any(
@@ -1479,7 +1491,7 @@ def _build_skills_system_prompt_inner(
         for cat, cat_desc in _read_category_descriptions(ext_dir, "Could not read external skill description %s: %s").items():
             category_descriptions.setdefault(cat, cat_desc)
 
-    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools)
+    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools, instruction_package_id)
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)

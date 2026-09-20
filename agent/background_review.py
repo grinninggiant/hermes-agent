@@ -929,6 +929,9 @@ def _fork_init_kwargs(agent: Any, rt: Dict[str, Any], routed: bool, max_iteratio
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None),
         "disabled_toolsets": getattr(agent, "disabled_toolsets", None), "skip_memory": True,
     }
+    package = getattr(agent, "_instruction_package", None)
+    if package is not None:
+        kwargs["instruction_package_id"] = package.package_id
     if isinstance(rt.get("max_tokens"), int):
         kwargs["max_tokens"] = rt["max_tokens"]
     if isinstance(rt.get("command"), str) and rt["command"]:
