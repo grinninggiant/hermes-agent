@@ -1,6 +1,30 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { installGuards, nativeWindows, requestDecision, recoveryAccepted } from './guards.mjs'
+import { installGuards, nativeWindows, requestDecision, recoveryAccepted, nodePty } from './guards.mjs'
+import * as ptyNamespace from './guards.mjs'
+
+test('node-pty ESM named and default imports reach the installed tripwire', () => {
+  for (const method of ['spawn', 'fork', 'createTerminal']) {
+    const original = nodePty[method]
+    let hits = 0
+    nodePty[method] = () => { hits++; throw new Error(`blocked node-pty.${method}`) }
+    try {
+      assert.throws(() => ptyNamespace[method](), new RegExp(`blocked node-pty.${method}`))
+      assert.throws(() => ptyNamespace.default[method](), new RegExp(`blocked node-pty.${method}`))
+      assert.equal(hits, 2)
+    } finally { nodePty[method] = original }
+  }
+})
+
+test('recovery acceptance requires a mounted complete document and no unrelated error', () => {
+  const dom = { readyState: 'complete', rootChildren: 1,
+    headings: ["Hermes couldn't start"],
+    errors: ["Error invoking remote method 'hermes:connection': Error: Backend unavailable in isolated startup smoke"] }
+  assert.equal(recoveryAccepted(dom), true)
+  assert.equal(recoveryAccepted({ ...dom, rootChildren: 0 }), false)
+  assert.equal(recoveryAccepted({ ...dom, readyState: 'loading' }), false)
+  assert.equal(recoveryAccepted({ ...dom, errors: [...dom.errors, 'Unrelated startup failure'] }), false)
+})
 
 // Doubles ensure even RED never reaches the host. Exercise the real installer.
 for (const target of ['nativeWindows.activeWindow', 'nativeWindows.openWindows',
@@ -44,7 +68,7 @@ test('only the exact expected stylesheet is classified as expected; all requests
   assert.equal(violations.length, 4)
 })
 test('accepts actual recovery heading and exact backend error, rejects loading and unrelated errors', () => {
-  const dom = {rootChildren:1, headings:["Hermes couldn't start"], errors:["Error invoking remote method 'hermes:connection': Error: Backend unavailable in isolated startup smoke"]}
+  const dom = {readyState:'complete', rootChildren:1, headings:["Hermes couldn't start"], errors:["Error invoking remote method 'hermes:connection': Error: Backend unavailable in isolated startup smoke"]}
   assert.equal(recoveryAccepted(dom), true)
   assert.equal(recoveryAccepted({...dom, errors:['Other error']}), false)
   assert.equal(recoveryAccepted({...dom, headings:['Loading…']}), false)

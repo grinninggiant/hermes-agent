@@ -2,6 +2,10 @@
 export const nodePty = {}
 export const nativeWindows = {}
 export default nodePty
+// The bundle imports node-pty as an ESM namespace, not only its default object.
+export const spawn = (...args) => nodePty.spawn(...args)
+export const fork = (...args) => nodePty.fork(...args)
+export const createTerminal = (...args) => nodePty.createTerminal(...args)
 export function installGuards(apis, forbidden) {
   const { childProcess, http, https, net, tls, process, globalThis: globals, app, globalShortcut } = apis
   for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']) childProcess[name] = forbidden(`child_process.${name}`)
@@ -33,6 +37,7 @@ export function requestDecision(details, violation) {
   return { cancel: true }
 }
 export function recoveryAccepted(dom) {
-  return dom.headings.includes("Hermes couldn't start") &&
-    dom.errors.includes("Error invoking remote method 'hermes:connection': Error: Backend unavailable in isolated startup smoke")
+  return dom.readyState === 'complete' && dom.rootChildren > 0 &&
+    dom.headings.includes("Hermes couldn't start") && dom.errors.length === 1 &&
+    dom.errors[0] === "Error invoking remote method 'hermes:connection': Error: Backend unavailable in isolated startup smoke"
 }

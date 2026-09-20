@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, cpSync, writeFileSync, readFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { spawn } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
@@ -38,11 +38,23 @@ await build({ entryPoints: [path.join(desktop, 'electron/preload.ts')], bundle: 
 const env = { HOME: path.join(root, 'home'), HERMES_HOME: path.join(root, 'hermes-home'),
   HERMES_DESKTOP_USER_DATA_DIR: path.join(root, 'userData'), TMPDIR: path.join(root, 'temp'),
   PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LANG: 'en_US.UTF-8' }
-const args = [appRoot, `--user-data-dir=${env.HERMES_DESKTOP_USER_DATA_DIR}`]
-writeFileSync(path.join(root, 'launch.json'), JSON.stringify({ testBundle: true, productionAcceptance: false, env, args }, null, 2))
+const probe = ['--probe-tripwires', '--probe-network'].filter(flag => process.argv.includes(flag))
+if (probe.length > 1) throw new Error('Choose one negative probe at a time')
+const args = [appRoot, `--user-data-dir=${env.HERMES_DESKTOP_USER_DATA_DIR}`, ...probe]
+let executable = require('electron')
+// Only sign a disposable dependency copy; never modify the dependency or installed app.
+if (process.argv.includes('--signed-copy')) {
+  if (process.platform !== 'darwin') throw new Error('--signed-copy requires macOS')
+  const source = path.resolve(executable, '../../..')
+  const copy = path.join(root, 'Electron.app')
+  execFileSync('/usr/bin/python3', ['-I', path.join(desktop, 'electron/startup-smoke/sign-copy.py'),
+    desktop, source, root], { env, stdio: 'pipe' })
+  executable = path.join(copy, 'Contents/MacOS/Electron')
+}
+writeFileSync(path.join(root, 'launch.json'), JSON.stringify({ testBundle: true, productionAcceptance: false, executable, env, args }, null, 2))
 console.log(`TEST_BUNDLE=${root}`)
 if (process.argv.includes('--build-only')) process.exit(0)
-const child = spawn(require('electron'), args, { env, stdio: ['ignore', 'pipe', 'pipe'], cwd: root })
+const child = spawn(executable, args, { env, stdio: ['ignore', 'pipe', 'pipe'], cwd: root })
 const output = []
 child.stdout.on('data', data => output.push(data))
 child.stderr.on('data', data => output.push(data))
