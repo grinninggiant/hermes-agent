@@ -10,6 +10,7 @@ import {
   type RuntimeSelection,
   validateRuntimeCoordinate
 } from './connection-runtime'
+import { isIndependentGeneralService } from './runtime-independent-service'
 import { RuntimeTransitionController, RuntimeTransitionJournal } from './runtime-transition'
 
 type State = 'absent' | 'alive' | 'unknown'
@@ -63,7 +64,7 @@ export async function inspectClosedDesktop(
 
     // Ownership includes old parents, not just the currently installed app path.
     for (const entry of parsed.entries) {
-      const identities = entry.profile === 'general' ? [{ pid: entry.pid, startMarker: entry.startMarker }] : []
+      const identities = [{ pid: entry.pid, startMarker: entry.startMarker }]
 
       if (entry.parentPid && entry.parentStartMarker) {
         identities.push({ pid: entry.parentPid, startMarker: entry.parentStartMarker })
@@ -84,10 +85,13 @@ export async function inspectClosedDesktop(
       }
     }
 
-    // Inspect full argv through the existing backend matcher: unowned legacy
-    // backends cannot be assumed absent. Conservative: any serve blocks maintenance.
-    if (processes.some(p => backendCommandMatches(p.command))) {
-      return 'alive'
+    // Desktop evidence above wins even when launchd claims the same PID.
+    // Unknown/unowned serve remains blocking unless the exact independent
+    // General service supplies fresh, stable job + incarnation evidence.
+    for (const row of processes.filter(p => backendCommandMatches(p.command))) {
+      if (parsed.entries.some(entry => entry.pid === row.pid || entry.parentPid === row.pid)) {return 'alive'}
+
+      if (!(await isIndependentGeneralService(row))) {return 'alive'}
     }
 
     return 'absent'

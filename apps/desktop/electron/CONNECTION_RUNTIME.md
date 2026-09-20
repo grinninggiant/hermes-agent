@@ -58,10 +58,10 @@ the exact current selection in `expected`. Only the source-provisioned pins are
 accepted; the CLI has no trust override and starts neither Electron nor backend.
 
 Quit Desktop manually and keep it closed until the command completes. macOS only.
-The entry independently scans processes, probes recorded General backend identities
+The entry independently scans processes, probes all recorded Desktop backend identities
 and recorded parents, and rejects alive/unknown/missing/malformed ownership. It
-also conservatively refuses ANY recognizable serve/dashboard process, including
-unrelated profiles; it never stops one. Process inspection uses existing ownership
+also refuses recognizable serve/dashboard processes unless the exact independent
+General SDK launchd service is proven below; it never stops one. Process inspection uses existing ownership
 parsing, command matching and start-marker contracts. It does not read credentials
 or decrypt connection envelopes. No default personal userData path is inferred.
 
@@ -123,10 +123,18 @@ Focused review run: **153 tests passed across 8 files**; full Desktop renderer,
 Electron and E2E typechecks passed; `git diff --check` passed. No live personal
 registry, app installation, process or credentials were modified.
 
-No reliable exclusion proof for independent SDK serve on port 9120 was added:
-the conservative any-recognizable-serve block is explicitly retained and tested.
-A port number or missing ownership row does not prove a process is unrelated.
-Therefore manual Desktop quit alone may still not make the live CLI eligible.
+Independent SDK ownership is narrowly recognized for the current user's existing
+`gui/<uid>/ai.hermes.serve-general` job: exact LaunchAgent path, wrapper program,
+running job PID and run count, exact General argv, and the interpreter from the
+existing `.local/bin/hermes` launcher must agree. Job and process start/executable
+readbacks must remain stable; every inspection repeats them. Missing, duplicate,
+stale, conflicting or timed-out evidence leaves serve blocking. Installed-app and
+all Desktop ownership checks run first; even stale same-PID Desktop records block
+the exemption. No request field can choose an ignored PID, service or port.
+This is process ownership classification, not new executable authorization or a
+same-user tamper defense. It retains the existing macOS second-resolution start
+identity limitation and the operator-reviewed service contract. A port number or
+missing ownership row alone never proves independence.
 Do not kill or ignore that service to force passage. Installed-app path and
 userData remain operator-reviewed inputs, not automatically attested discovery.
 Repeated inventory checks and the cooperative maintenance lease cannot prevent
