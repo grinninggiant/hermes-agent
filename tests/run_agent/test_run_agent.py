@@ -2253,6 +2253,31 @@ class TestConcurrentToolExecution:
 
 
 
+    def test_invoke_tool_pre_hook_distinguishes_review_fork_from_foreground(self, agent, monkeypatch):
+        """The concurrent tool path must not borrow foreground progress ownership."""
+        observed = []
+        post_calls = []
+
+        def pre_hook(_name, _args, **kwargs):
+            observed.append(kwargs)
+            return "Blocked by policy", None
+
+        monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", pre_hook)
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: name == "post_tool_call")
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda name, **kw: post_calls.append(kw))
+        agent.session_id = "shared-session"
+        agent._current_turn_id = "foreground-turn"
+        agent._invoke_tool("todo_list", {}, "task-1", tool_call_id="call-1")
+        agent._memory_write_context = "background_review"  # Set by build_cache_parity_fork.
+        agent._current_turn_id = "review-turn"
+        agent._invoke_tool("todo_list", {}, "task-2", tool_call_id="call-2")
+
+        assert [row["execution_context"] for row in observed] == ["foreground", "background_review"]
+        assert [row["session_id"] for row in observed] == ["shared-session", "shared-session"]
+        assert [row["turn_id"] for row in observed] == ["foreground-turn", "review-turn"]
+        assert [row["execution_context"] for row in post_calls] == ["foreground", "background_review"]
+        assert [row["tool_call_id"] for row in post_calls] == ["call-1", "call-2"]
+
     def test_invoke_tool_handles_agent_level_tools(self, agent):
         """_invoke_tool should handle todo tool directly."""
         with patch("tools.todo_tool.todo_tool", return_value='{"ok":true}') as mock_todo:

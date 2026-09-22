@@ -616,6 +616,7 @@ def _emit_post_tool_call_hook(
     *, function_name: str, function_args: Dict[str, Any], result: Any,
     task_id: Optional[str] = None, session_id: Optional[str] = None, tool_call_id: Optional[str] = None,
     turn_id: Optional[str] = None, api_request_id: Optional[str] = None, duration_ms: int = 0,
+    execution_context: Optional[str] = None,
     status: Optional[str] = None, error_type: Optional[str] = None, error_message: Optional[str] = None,
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
@@ -632,6 +633,7 @@ def _emit_post_tool_call_hook(
         invoke_hook(
             "post_tool_call", tool_name=function_name, args=function_args, result=result,
             **_CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id).hook_kwargs(),
+            **({"execution_context": execution_context} if execution_context is not None else {}),
             duration_ms=duration_ms, status=status, error_type=error_type, error_message=error_message,
             middleware_trace=list(middleware_trace or []),
         )
