@@ -205,8 +205,8 @@ _FROZEN_PREFIX_GENERATIONS = (
 
 
 # The generation retired by #69619, pinned individually for the review
-# regression below. Index 1 after the #80622 freeze was prepended.
-_PRE_69619_LIVE_PREFIX = _FROZEN_PREFIX_GENERATIONS[1]
+# regression below. Index 2 after the #80622 and memory-precedence freezes.
+_PRE_69619_LIVE_PREFIX = _FROZEN_PREFIX_GENERATIONS[2]
 
 
 def test_no_user_after_handoff_must_not_act():
@@ -230,6 +230,7 @@ def test_pre_69619_prefix_generation_is_frozen_and_stripped():
         ContextCompressor,
     )
 
+    assert "## Historical In-Progress State" in _PRE_69619_LIVE_PREFIX
     assert _PRE_69619_LIVE_PREFIX in _HISTORICAL_SUMMARY_PREFIXES, (
         "pre-#69619 live prefix missing from _HISTORICAL_SUMMARY_PREFIXES — "
         "summaries persisted by the immediately previous build are no longer "
