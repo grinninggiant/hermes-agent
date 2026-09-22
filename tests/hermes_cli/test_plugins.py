@@ -1358,6 +1358,7 @@ class TestPreToolCallDirective:
                     "turn_id": "",
                     "api_request_id": "",
                     "middleware_trace": [],
+                    "execution_context": "foreground",
                 },
             )
         ]

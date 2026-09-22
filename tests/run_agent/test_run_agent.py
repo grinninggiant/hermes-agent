@@ -2258,13 +2258,16 @@ class TestConcurrentToolExecution:
         observed = []
         post_calls = []
 
-        def pre_hook(_name, _args, **kwargs):
-            observed.append(kwargs)
-            return "Blocked by policy", None
+        def lifecycle_hook(name, **kwargs):
+            if name == "pre_tool_call":
+                observed.append(kwargs)
+                return [{"action": "block", "message": "Blocked by policy"}]
+            if name == "post_tool_call":
+                post_calls.append(kwargs)
+            return []
 
-        monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", pre_hook)
         monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: name == "post_tool_call")
-        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda name, **kw: post_calls.append(kw))
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lifecycle_hook)
         agent.session_id = "shared-session"
         agent._current_turn_id = "foreground-turn"
         agent._invoke_tool("todo_list", {}, "task-1", tool_call_id="call-1")
