@@ -2102,17 +2102,12 @@ def _build_skills_system_prompt_inner(
                     index_lines.append(f"    - {name}")
 
         result = (
-            "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
+            "## Skills\n"
+            "Use the skill index to select guidance for the current task. Load a skill with skill_view(name) when "
+            "its stated trigger matches the work you are performing; do not load it solely because it shares a "
+            "topic word. Start with the matching skill's router and load only references needed for the next "
+            "action. Follow applicable domain instructions and required governance; this selection rule does not "
+            "relax security, approval, credential, Stop, or human-owned completion boundaries.\n"
             "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
             "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
@@ -2124,10 +2119,7 @@ def _build_skills_system_prompt_inner(
             "pitfalls you discovered, update it before finishing.\n"
             "\n"
             "<available_skills>\n"
-            + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            + "\n".join(index_lines) + '\n</available_skills>\n\nIf no skill trigger matches, proceed with the available tools. Reassess skill selection when task scope changes.'
             + hidden_note
         )
 
