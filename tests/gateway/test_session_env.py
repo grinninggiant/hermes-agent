@@ -1,5 +1,6 @@
 import asyncio
 import os
+from pathlib import Path
 
 import pytest
 
@@ -74,6 +75,23 @@ def test_set_session_env_sets_contextvars(monkeypatch):
 
     # Clean up
     runner._clear_session_env(tokens)
+
+
+def test_unrouted_session_binds_actual_serving_profile(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes" / "profiles" / "general"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="session")
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+
+    tokens = runner._set_session_env(context)
+    try:
+        assert source.profile is None  # No configured cross-profile route.
+        assert get_session_env("HERMES_SESSION_PROFILE") == "general"
+    finally:
+        runner._clear_session_env(tokens)
 
 
 def test_clear_session_env_restores_previous_state(monkeypatch):
