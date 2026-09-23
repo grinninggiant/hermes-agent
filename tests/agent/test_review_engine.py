@@ -147,6 +147,71 @@ def test_load_review_credentials_cfg_missing_section(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+def _capture_child_runtime(monkeypatch, config):
+    """Exercise real routing; replace only provider auth, agent and execution."""
+    import tools.delegate_tool as dt
+    from hermes_cli import runtime_provider
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", lambda **kw: {
+        "model": kw.get("target_model"), "provider": kw["requested"],
+        "api_key": "test-key", "base_url": "https://example.invalid/v1",
+        "api_mode": "codex_responses",
+    })
+    built = []
+    child = MagicMock()
+    child._delegate_role = "leaf"
+    monkeypatch.setattr("run_agent.AIAgent", lambda **kw: built.append(kw) or child)
+    monkeypatch.setattr(dt, "_run_single_child", lambda *a, **kw: {
+        "task_index": 0, "status": "completed", "summary": "ok", "api_calls": 1,
+        "duration_seconds": 0.1, "model": "test", "exit_reason": "completed",
+    })
+    parent = _fake_parent()
+    parent.model = "gpt-6-sol"
+    parent.provider = "openai-codex"
+    parent.base_url = "https://example.invalid/v1"
+    parent.api_key = "test-key"
+    parent.api_mode = "codex_responses"
+    parent.reasoning_config = {"enabled": True, "effort": "high"}
+    parent._session_db = None
+    return dt, parent, built
+
+
+def test_review_route_uses_its_explicit_xhigh_not_general_effort(monkeypatch):
+    _dt, parent, built = _capture_child_runtime(monkeypatch, {
+        "delegation": {"reasoning_effort": "high"},
+        "auxiliary": {"review": {
+            "provider": "openai-codex", "model": "gpt-6-astra", "reasoning_effort": "xhigh",
+        }},
+    })
+    assert start_review(parent, [{"role": "user", "content": "Review this PR"}])["status"] == "dispatched"
+    assert built[0]["model"] == "gpt-6-astra"
+    assert built[0]["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+    assert built[0]["fallback_model"] is None  # pinned review never borrows the parent's fallback
+    schema = _dt.DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+    assert "reasoning_effort" not in schema
+    assert "reasoning_effort" not in schema["tasks"]["items"]["properties"]
+
+
+def test_review_route_without_effort_keeps_delegation_default(monkeypatch):
+    _dt, parent, built = _capture_child_runtime(monkeypatch, {
+        "delegation": {"reasoning_effort": "high"},
+        "auxiliary": {"review": {"provider": "openai-codex", "model": "gpt-6-astra"}},
+    })
+    parent.reasoning_config = {"enabled": True, "effort": "low"}
+    assert start_review(parent, [{"role": "user", "content": "Review this PR"}])["status"] == "dispatched"
+    assert built[0]["reasoning_config"] == {"enabled": True, "effort": "high"}
+
+
+def test_general_delegation_keeps_default_model_and_high_effort(monkeypatch):
+    dt, parent, built = _capture_child_runtime(monkeypatch, {
+        "delegation": {"reasoning_effort": "high"},
+        "auxiliary": {"review": {"provider": "openai-codex", "model": "gpt-6-astra", "reasoning_effort": "xhigh"}},
+    })
+    assert json.loads(dt.delegate_task(goal="ordinary work", parent_agent=parent))["results"][0]["status"] == "completed"
+    assert built[0]["model"] == "gpt-6-sol"
+    assert built[0]["reasoning_config"] == {"enabled": True, "effort": "high"}
+
 # delegate_task credentials_cfg override (the internal /review routing hook)
 # ---------------------------------------------------------------------------
 
