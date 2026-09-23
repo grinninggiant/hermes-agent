@@ -1531,7 +1531,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     def _execute(next_args: dict) -> Any:
         import model_tools
 
-        with model_tools.suppress_post_tool_call_hook():
+        with model_tools.suppress_post_tool_call_hook(function_name):
             return model_tools.handle_function_call(
                 function_name,
                 next_args,

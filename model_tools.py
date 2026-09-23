@@ -25,13 +25,13 @@ from tools.arg_coercion import coerce_tool_args
 
 logger = logging.getLogger(__name__)
 
-_post_tool_call_hook_suppressed: ContextVar[bool] = ContextVar("post_tool_call_hook_suppressed", default=False)
+_post_tool_call_hook_suppressed: ContextVar[Optional[str]] = ContextVar("post_tool_call_hook_suppressed", default=None)
 
 
 @contextmanager
-def suppress_post_tool_call_hook():
-    """Let an outer executor own the terminal post-tool event."""
-    token = _post_tool_call_hook_suppressed.set(True)
+def suppress_post_tool_call_hook(function_name: str):
+    """Let the outer executor own this tool's post event, not nested tools' events."""
+    token = _post_tool_call_hook_suppressed.set(function_name)
     try:
         yield
     finally:
@@ -622,7 +622,7 @@ def _emit_post_tool_call_hook(
 ) -> None:
     """Emit the ``post_tool_call`` observer hook; gated on has_hook, and ok/error
     fields are derived from the result only past that gate when status is None."""
-    if _post_tool_call_hook_suppressed.get():
+    if _post_tool_call_hook_suppressed.get() == function_name:
         return
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook
