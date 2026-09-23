@@ -2160,6 +2160,7 @@ class TestConcurrentToolExecution:
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
                 tool_request_middleware_trace=[],
+                execution_context="foreground",
             )
             assert result == "result"
 

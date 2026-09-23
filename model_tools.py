@@ -702,6 +702,7 @@ def _apply_request_middleware(
 
 def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip_pre_tool_call_hook: bool,
                          ids: _CallIds, middleware_trace: List[Dict[str, Any]],
+                         execution_context: Optional[str] = None,
                          ) -> Tuple[Dict[str, Any], Optional[Tuple[Any, str, Optional[str]]]]:
     """Plugin pre_tool_call hook, then ACP edit approval.
 
@@ -715,7 +716,8 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
         try:
             from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
             block_message, modified_args = _dispatch_pre_tool_call_hooks(
-                function_name, function_args, middleware_trace=list(middleware_trace), **ids.hook_kwargs(),
+                function_name, function_args, middleware_trace=list(middleware_trace),
+                execution_context=execution_context or "foreground", **ids.hook_kwargs(),
             )
             if modified_args is not None:
                 function_args = modified_args
@@ -815,6 +817,7 @@ def handle_function_call(
     skip_pre_tool_call_hook: bool = False, skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False, tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
+    execution_context: Optional[str] = None,
 ) -> str:
     """Route a tool call through hooks/middleware to the registry; returns a JSON string.
 
@@ -835,7 +838,8 @@ def handle_function_call(
     def _emit(result: Any, **extra: Any) -> Any:
         """Emit post_tool_call with this call's identity fields; returns *result*."""
         _emit_post_tool_call_hook(function_name=function_name, function_args=function_args, result=result,
-                                  **asdict(ids), middleware_trace=list(trace), **extra)
+                                  **asdict(ids), execution_context=execution_context,
+                                  middleware_trace=list(trace), **extra)
         return result
 
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
@@ -853,12 +857,14 @@ def handle_function_call(
                 underlying[1]["calls"], ids, user_task=user_task,
                 enabled_tools=enabled_tools, middleware_trace=trace,
                 enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+                execution_context=execution_context,
             ), duration_ms=_elapsed_ms(start))
         return handle_function_call(
             *underlying, **asdict(ids), user_task=user_task, enabled_tools=enabled_tools,
             skip_pre_tool_call_hook=skip_pre_tool_call_hook, skip_tool_request_middleware=skip_tool_request_middleware,
             skip_tool_execution_middleware=skip_tool_execution_middleware, tool_request_middleware_trace=list(trace),
             enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+            execution_context=execution_context,
         )
 
     from tools.tool_gateway.names import is_connector_name, parse_connector_name
@@ -876,7 +882,9 @@ def handle_function_call(
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
 
-        function_args, blocked = _pre_dispatch_guards(function_name, function_args, skip_pre_tool_call_hook, ids, trace)
+        function_args, blocked = _pre_dispatch_guards(
+            function_name, function_args, skip_pre_tool_call_hook, ids, trace, execution_context,
+        )
         if blocked is not None:
             result, error_type, error_message = blocked
             return _emit(result, status="blocked", error_type=error_type, error_message=error_message)

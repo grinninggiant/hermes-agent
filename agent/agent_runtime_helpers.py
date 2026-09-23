@@ -2259,6 +2259,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                execution_context=hook_ids["execution_context"],
             )
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
