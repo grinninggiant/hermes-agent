@@ -67,6 +67,45 @@ def test_sequential_registry_post_is_outer_owned_and_scope_resets():
     ]
 
 
+def test_same_name_nested_tool_keeps_its_own_post_hook():
+    from agent.tool_executor import _ToolCallRef, _resolve_sequential_dispatch
+    from model_tools import handle_function_call
+
+    agent = SimpleNamespace(
+        session_id="review-session", _current_turn_id="turn", _current_api_request_id="request",
+        _memory_write_context="background_review", valid_tool_names=["read_file"],
+        enabled_toolsets=None, disabled_toolsets=None, _memory_manager=None,
+        _context_engine_tool_names=set(), quiet_mode=False,
+    )
+    hooks = []
+    calls = []
+
+    def dispatch(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            assert handle_function_call(
+                "read_file", {"path": "/inner"}, "task", tool_call_id="inner",
+                session_id="review-session", turn_id="turn", execution_context="background_review",
+                skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            ) == '{"ok": true}'
+        return '{"ok": true}'
+
+    with (
+        patch("hermes_cli.plugins._dispatch_pre_tool_call_hooks", return_value=(None, None)),
+        patch("hermes_cli.lifecycle.has_hook", side_effect=lambda name: name == "post_tool_call"),
+        patch("hermes_cli.lifecycle.invoke_hook", side_effect=lambda name, **kw: hooks.append((name, kw)) or []),
+        patch("model_tools.registry.dispatch", side_effect=dispatch),
+    ):
+        ref = _ToolCallRef("read_file", {"path": "/outer"}, "task", "outer", [])
+        assert _resolve_sequential_dispatch(agent, ref, []).execute(ref.args) == '{"ok": true}'
+    assert len(calls) == 2
+    assert [(kw["tool_name"], kw["tool_call_id"], kw["execution_context"])
+            for name, kw in hooks if name == "post_tool_call"] == [
+        ("read_file", "inner", "background_review"),
+    ]
+
+
 @pytest.mark.parametrize("sequential", [False, True])
 def test_connector_batch_entry_keeps_execution_context(monkeypatch, sequential):
     from tools.registry import invalidate_check_fn_cache

@@ -13,6 +13,7 @@ import asyncio
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from contextvars import ContextVar
+from functools import wraps
 import logging
 import threading
 import time
@@ -25,17 +26,29 @@ from tools.arg_coercion import coerce_tool_args
 
 logger = logging.getLogger(__name__)
 
-_post_tool_call_hook_suppressed: ContextVar[Optional[str]] = ContextVar("post_tool_call_hook_suppressed", default=None)
+_tool_call_depth: ContextVar[int] = ContextVar("tool_call_depth", default=0)
+_post_tool_call_hook_suppressed: ContextVar[Optional[int]] = ContextVar("post_tool_call_hook_suppressed", default=None)
 
 
 @contextmanager
-def suppress_post_tool_call_hook(function_name: str):
-    """Let the outer executor own this tool's post event, not nested tools' events."""
-    token = _post_tool_call_hook_suppressed.set(function_name)
+def suppress_post_tool_call_hook():
+    """Let the outer executor own only the next dispatch's post event."""
+    token = _post_tool_call_hook_suppressed.set(_tool_call_depth.get() + 1)
     try:
         yield
     finally:
         _post_tool_call_hook_suppressed.reset(token)
+
+
+def _track_tool_call_depth(function):
+    @wraps(function)
+    def tracked(*args, **kwargs):
+        token = _tool_call_depth.set(_tool_call_depth.get() + 1)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _tool_call_depth.reset(token)
+    return tracked
 
 # Platform-bundle names already flagged in disabled_toolsets (advisory logged once per name).
 _WARNED_DISABLED_BUNDLES: set = set()
@@ -622,7 +635,7 @@ def _emit_post_tool_call_hook(
 ) -> None:
     """Emit the ``post_tool_call`` observer hook; gated on has_hook, and ok/error
     fields are derived from the result only past that gate when status is None."""
-    if _post_tool_call_hook_suppressed.get() == function_name:
+    if _post_tool_call_hook_suppressed.get() == _tool_call_depth.get():
         return
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook
@@ -810,6 +823,7 @@ def _elapsed_ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
 
 
+@_track_tool_call_depth
 def handle_function_call(
     function_name: str, function_args: Dict[str, Any], task_id: Optional[str] = None,
     tool_call_id: Optional[str] = None, session_id: Optional[str] = None, turn_id: Optional[str] = None,
