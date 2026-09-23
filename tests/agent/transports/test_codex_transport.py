@@ -35,6 +35,20 @@ class TestCodexTransportBasic:
 
 class TestCodexBuildKwargs:
 
+    @pytest.mark.parametrize("model,expected", [
+        ("gpt-6-luna", "max"), ("openai/gpt-6-luna", "max"),
+        ("gpt-6-luna-preview", "max"), ("gpt-6-sol", "max"),
+        ("gpt-5.5", "xhigh"),
+    ])
+    def test_luna_max_emitted_on_codex_wire_without_clamp(self, transport, model, expected):
+        kwargs = transport.build_kwargs(
+            model=model, messages=[{"role": "user", "content": "Hi"}], tools=[],
+            provider="openai-codex", base_url="https://chatgpt.com/backend-api/codex",
+            is_codex_backend=True, reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert kwargs["model"] == model
+        assert kwargs["reasoning"]["effort"] == expected
+
     def test_astra_direct_request_applies_model_contract_after_overrides(self, transport):
         kw = transport.build_kwargs(
             model="gpt-6-astra",
