@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.agent_runtime_helpers import invoke_tool
 
 
@@ -71,7 +73,8 @@ def test_connector_batch_entry_keeps_execution_context(monkeypatch):
     ]
 
 
-def test_background_review_connector_pre_hook_blocks_before_remote_dispatch(monkeypatch):
+@pytest.mark.parametrize("sequential", [False, True])
+def test_background_review_connector_pre_hook_blocks_before_remote_dispatch(monkeypatch, sequential):
     from tools.registry import invalidate_check_fn_cache
     from tools.tool_gateway import bridge, config
 
@@ -90,7 +93,7 @@ def test_background_review_connector_pre_hook_blocks_before_remote_dispatch(monk
         session_id="review-session", _current_turn_id="review-turn",
         _current_api_request_id="request-1", _memory_write_context="background_review",
         valid_tool_names=["tool_call"], enabled_toolsets=["connections"],
-        disabled_toolsets=None, _memory_manager=None,
+        disabled_toolsets=None, _memory_manager=None, _context_engine_tool_names=set(), quiet_mode=False,
     )
     seen = []
 
@@ -103,11 +106,18 @@ def test_background_review_connector_pre_hook_blocks_before_remote_dispatch(monk
             return [{"action": "block", "message": "review connector denied"}]
         return []
 
+    args = {"calls": [{"name": "connectors__gmail__FETCH_EMAILS", "arguments": {}}]}
     with patch("hermes_cli.lifecycle.invoke_hook", side_effect=policy):
-        result = invoke_tool(
-            agent, "tool_call", {"calls": [{"name": "connectors__gmail__FETCH_EMAILS", "arguments": {}}]},
-            "task", "call", skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
-        )
+        if sequential:
+            from agent.tool_executor import _ToolCallRef, _resolve_sequential_dispatch
+
+            ref = _ToolCallRef("tool_call", args, "task", "call", [])
+            result = _resolve_sequential_dispatch(agent, ref, []).execute(args)
+        else:
+            result = invoke_tool(
+                agent, "tool_call", args, "task", "call",
+                skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
+            )
     assert sent == []
     assert "review connector denied" in result
     assert ("connectors__gmail__FETCH_EMAILS", "background_review") in seen
