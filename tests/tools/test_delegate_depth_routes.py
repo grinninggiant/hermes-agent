@@ -168,6 +168,11 @@ def test_native_child_route_reaches_responses_wire(tmp_path, monkeypatch, depth,
     {"1": {"model": "m", "api_mode": "unknown"}},
     {"1": {"model": "m", "request_overrides": []}},
     {"1": {"model": "m", "fallback_providers": [{"model": "missing-provider"}]}},
+    {"1": {"provider": "openai-codex", "model": "gpt-6-luna", "reasoning_effort": "max",
+           "fallback_providers": [{"provider": "openrouter", "model": "fallback-model",
+                                   "base_ur1": "https://invalid.example/v1"}]}},
+    {"1": {"provider": "openai-codex", "model": "gpt-6-luna", "reasoning_effort": "max",
+           "request_overrides": {"extra_body": {"provider": "unexpected"}}}},
     {True: {"model": "m"}}, [],
 ])
 def test_invalid_route_fails_before_spawn(tmp_path, monkeypatch, routes):
