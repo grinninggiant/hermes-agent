@@ -152,6 +152,8 @@ def _load_review_credentials_cfg() -> Optional[Dict[str, Any]]:
         cfg["provider"] = ""
     if not (cfg["provider"] or cfg["model"] or cfg["base_url"]):
         return None
+    if "reasoning_effort" in review:
+        cfg["reasoning_effort"] = review["reasoning_effort"]
     return cfg
 
 
