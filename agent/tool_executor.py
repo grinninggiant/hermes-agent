@@ -1660,6 +1660,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 tool_request_middleware_trace=list(middleware_trace),
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                execution_context=tool_hook_ids(agent, effective_task_id, tool_call_id)["execution_context"],
             )
 
     return _SequentialDispatch(

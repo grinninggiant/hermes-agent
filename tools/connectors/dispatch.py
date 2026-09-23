@@ -19,7 +19,7 @@ def dispatch_connector_call(name, arguments, tool_call_id):
 
 
 def dispatch_connector_batch(calls, ids, *, user_task, enabled_tools,
-                             middleware_trace, enabled_toolsets, disabled_toolsets):
+                             middleware_trace, enabled_toolsets, disabled_toolsets, execution_context=None):
     from model_tools import handle_function_call
     from tools.interrupt import is_interrupted
 
@@ -45,6 +45,7 @@ def dispatch_connector_batch(calls, ids, *, user_task, enabled_tools,
             skip_pre_tool_call_hook=False, skip_tool_request_middleware=False,
             skip_tool_execution_middleware=False,
             enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+            execution_context=execution_context,
         )
         try:
             value = json.loads(payload) if isinstance(payload, str) else payload

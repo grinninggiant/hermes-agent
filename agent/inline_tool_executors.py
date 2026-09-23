@@ -76,9 +76,11 @@ def apply_transform_tool_result(
     ``post_tool_call``) to keep the hook's "every tool" contract. Fail-open."""
     try:
         from model_tools import _CallIds, _apply_transform_tool_result_hook
+        hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
+        hook_ids.pop("execution_context")  # Execution metadata is not a _CallIds field.
         return _apply_transform_tool_result_hook(
             function_name, function_args, result, duration_ms,
-            _CallIds(**tool_hook_ids(agent, effective_task_id, tool_call_id)),
+            _CallIds(**hook_ids),
         )
     except Exception:
         return result
