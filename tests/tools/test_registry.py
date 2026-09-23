@@ -29,6 +29,43 @@ def _make_schema(name="test_tool"):
 
 
 class TestRegisterAndDispatch:
+    def test_plugin_handler_receives_core_turn_id_not_model_arg(self):
+        from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+        from model_tools import handle_function_call
+
+        ctx = PluginContext(PluginManifest(name="turn-probe", source="user"), PluginManager())
+        received = []
+
+        def handler(args, *, task_id, session_id, user_task, turn_id):
+            received.append((args, turn_id))
+            return json.dumps({"turn_id": turn_id})
+
+        def legacy(args, *, task_id, session_id, user_task):
+            return json.dumps({"ok": True})
+
+        handles = [
+            ctx.register_tool(name=name, toolset="turn-probe", schema=_make_schema(name), handler=fn)
+            for name, fn in (("_test_turn_probe", handler), ("_test_legacy_probe", legacy))
+        ]
+        assert all(handles)
+        try:
+            result = handle_function_call(
+                "_test_turn_probe", {"turn_id": "model-spoof"}, turn_id="core-turn",
+                skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
+            assert json.loads(result) == {"turn_id": "core-turn"}
+            assert received == [({"turn_id": "model-spoof"}, "core-turn")]
+            assert json.loads(handle_function_call(
+                "_test_legacy_probe", {}, turn_id="core-turn",
+                skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )) == {"ok": True}
+        finally:
+            for handle in handles:
+                if handle:
+                    handle.dispose()
+
     def test_register_and_dispatch(self):
         reg = ToolRegistry()
         reg.register(
