@@ -32,6 +32,7 @@ from tools.delegate_tool_config import (  # noqa: F401
     _get_max_spawn_depth, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
     _resolve_child_runtime, _resolve_delegation_credentials,
+    _route_for_child_depth,
     _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
@@ -468,8 +469,9 @@ def delegate_task(
     # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
     # a per-call routing owner shaped like the delegation config section. Keep
     # the route and its fallback policy together through child construction.
-    routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
     try:
+        routing_cfg = credentials_cfg if credentials_cfg is not None else _route_for_child_depth(
+            cfg, depth + 1)
         creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
     except ValueError as exc:
         # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the

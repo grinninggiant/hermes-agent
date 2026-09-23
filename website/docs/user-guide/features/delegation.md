@@ -608,6 +608,10 @@ delegation:
   # worktree_isolation: false               # Give each child its own git worktree (see Worktree Isolation above)
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.
   # orchestrator_enabled: true              # Disable to force all children to leaf role.
+  # depth_routes:                            # Optional exact child-depth routes (depth starts at 1).
+  #   1: {provider: openai-codex, model: gpt-6-astra, reasoning_effort: xhigh}
+  #   2: {provider: openai-codex, model: gpt-6-sol, reasoning_effort: high}
+  #   3: {provider: openai-codex, model: gpt-6-luna, reasoning_effort: max}
   model: "google/gemini-3-flash-preview"             # Optional provider/model override
   provider: "openrouter"                             # Optional built-in provider
   api_mode: anthropic_messages                       # optional; auto-detected from base_url for anthropic_messages endpoints
@@ -630,6 +634,8 @@ delegation:
       provider:
         sort: throughput   # children route to the fastest OpenRouter provider
 ```
+
+When `depth_routes` is set, the exact child depth selects a standalone route before credential resolution. No closest-depth match: omitted depths use the ordinary `delegation` model/provider/effort. A depth route does not merge the global delegation key, endpoint, fallback chain, request overrides, or reasoning effort; omitted effort inherits the parent. Its optional fields are `model`, `provider`, `reasoning_effort`, `base_url`, `api_key`, `api_mode`, `fallback_providers`, and `request_overrides`. Invalid maps or route fields refuse spawning; internal routes such as `/review` take precedence. Raise `max_spawn_depth` to at least 3 for the example above; existing approval and Stop controls remain unchanged.
 
 When `base_url` points at an Anthropic-compatible endpoint — for example a path ending in `/anthropic`, an Azure Foundry Claude route, or a MiniMax `/anthropic` proxy — `api_mode` is auto-detected as `anthropic_messages` so the subagent uses the right wire format without you setting anything. Set `api_mode` explicitly when the auto-detection guess is wrong (rare).
 

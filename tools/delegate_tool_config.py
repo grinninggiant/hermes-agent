@@ -383,6 +383,46 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         )
     return _runtime_provider_credentials(values, explicit_request_overrides)
 
+_DEPTH_ROUTE_FIELDS = frozenset({
+    "model", "provider", "base_url", "api_key", "api_mode", "reasoning_effort",
+    "request_overrides", "fallback_providers",
+})
+
+def _route_for_child_depth(cfg: dict, child_depth: int) -> dict:
+    """Select an exact, standalone trusted route; reject malformed opt-in maps before resolving credentials."""
+    routes = cfg.get("depth_routes", {})
+    if not isinstance(routes, dict):
+        raise ValueError("delegation.depth_routes must be a mapping of positive depths to routes")
+    selected = None
+    seen = set()
+    from hermes_constants import parse_reasoning_effort
+    for depth, route in routes.items():
+        if (isinstance(depth, bool) or not isinstance(depth, (str, int))
+                or not str(depth).isdecimal() or str(int(depth)) != str(depth) or int(depth) < 1
+                or int(depth) in seen):
+            raise ValueError(f"Invalid delegation.depth_routes depth {depth!r}; use positive integers")
+        seen.add(int(depth))
+        if not isinstance(route, dict) or not route or route.keys() - _DEPTH_ROUTE_FIELDS:
+            raise ValueError(f"Invalid delegation.depth_routes[{depth}] fields")
+        for key, value in route.items():
+            if key in {"request_overrides", "fallback_providers"}:
+                if key == "request_overrides" and not isinstance(value, dict):
+                    raise ValueError(f"delegation.depth_routes[{depth}].{key} must be a mapping")
+                if key == "fallback_providers" and (
+                    not isinstance(value, list) or len(get_fallback_chain({key: value})) != len(value)
+                ):
+                    raise ValueError(f"delegation.depth_routes[{depth}].{key} must contain valid routes")
+            elif key == "reasoning_effort":
+                if (value is not False and not isinstance(value, str)) or parse_reasoning_effort(value) is None:
+                    raise ValueError(f"Invalid delegation.depth_routes[{depth}].reasoning_effort")
+            elif not isinstance(value, str) or not value.strip() or (
+                key == "api_mode" and value not in _EXPLICIT_API_MODES
+            ):
+                raise ValueError(f"Invalid delegation.depth_routes[{depth}].{key}")
+        if int(depth) == child_depth:
+            selected = route
+    return ({"reasoning_effort": None, **selected}) if selected is not None else cfg
+
 def _load_config() -> dict:
     """The ``delegation`` config section (read-only — do NOT mutate). Prefers the shared ``load_config_readonly()``
     (follows HERMES_HOME/profile; no deepcopy, since this runs on every get_definitions() rebuild) over the legacy
