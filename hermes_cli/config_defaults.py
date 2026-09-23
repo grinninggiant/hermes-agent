@@ -1209,6 +1209,11 @@ DEFAULT_CONFIG = {
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
     # every configured provider is supported.
     "delegation": {
+        # Optional exact child-depth (1-based) routes. Each route stands alone: it never
+        # inherits model/provider/endpoint/key/fallback/request_overrides from this block.
+        # Omitted depths keep the legacy delegation route. Internal /review routes take precedence.
+        # Example: {1: {provider: openai-codex, model: gpt-6-astra, reasoning_effort: xhigh}}
+        "depth_routes": {},
         "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
         # Fallback chain for delegated children (same entry format as the top-level list).
