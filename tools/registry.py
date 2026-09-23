@@ -8,6 +8,7 @@ model_tools."""
 import ast
 import functools
 import importlib
+import inspect
 import json
 import logging
 import sys
@@ -178,6 +179,7 @@ class ToolEntry:
     # Zero-arg callable whose dict is shallow-merged onto the schema at every get_definitions()
     # — for fields tracking runtime config (delegate_task's description reflects limits).
     dynamic_schema_overrides: Optional[Callable] = None
+    plugin_tool: bool = False
 
 
 class _PluginOverridePolicy:
@@ -598,7 +600,7 @@ class ToolRegistry:
         check_fn: Callable = None, requires_env: list = None, is_async: bool = False,
         description: str = "", emoji: str = "", max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None, override: bool = False,
-        scope: Optional[str] = None):
+        scope: Optional[str] = None, plugin_tool: bool = False):
         """Register a tool (called at import time by each tool file). ``override=True`` is an
         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
         browser backend); without it, cross-toolset shadowing is rejected."""
@@ -651,7 +653,7 @@ class ToolRegistry:
                 requires_env=requires_env or [], is_async=is_async,
                 description=description or schema.get("description", ""), emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
-                dynamic_schema_overrides=dynamic_schema_overrides)
+                dynamic_schema_overrides=dynamic_schema_overrides, plugin_tool=plugin_tool)
             # Availability is derived per-tool (_toolset_has_exposable_tools), so this map no
             # longer gates a toolset; it still feeds get_toolset_requirements ->
             # TOOLSET_REQUIREMENTS["check_fn"], which banner.py reads (presence only,
@@ -808,13 +810,24 @@ class ToolRegistry:
             error_type="tool_result_contract", tool=name, result_type=result_type)
 
     def dispatch(
-        self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
+        self, name: str, args: dict, *, scope: Optional[str] = None,
+        _core_turn_id: Optional[str] = None, **kwargs) -> str | dict:
         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
         results normalized, every exception returned as ``{"error": ...}``."""
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
+            if entry.plugin_tool and _core_turn_id is not None:
+                try:
+                    params = inspect.signature(entry.handler).parameters
+                    if (params.get("turn_id") is not None
+                            and params["turn_id"].kind in (inspect.Parameter.KEYWORD_ONLY,
+                                                            inspect.Parameter.POSITIONAL_OR_KEYWORD)) or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                        kwargs["turn_id"] = _core_turn_id
+                except (TypeError, ValueError):
+                    pass  # Uninspectable legacy handler: keep its original kwargs.
             if entry.is_async:
                 from model_tools import _run_async
                 result = _run_async(entry.handler(args, **kwargs))
