@@ -532,6 +532,8 @@ def _lock_in_submit_turn(
     cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
     fields = {}
     with _session_turn_admission(session) as admitted:
+        if session.get("_runtime_quiescence"):
+            return _err(rid, 4093, "session admission closed for runtime transition"), fields
         if not admitted:
             return _err(rid, 5035, "backend is retiring; reconnect to continue"), fields
         # A watch session's run lives in the PARENT turn (own running flag False); typing

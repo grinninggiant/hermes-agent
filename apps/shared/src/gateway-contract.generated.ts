@@ -3338,6 +3338,25 @@ export interface LlmOneshotParams {
 export interface LlmOneshotResult {
   text: string
 }
+export interface RuntimeQuiesceParams {
+  session_id: string
+}
+export interface RuntimeQuiesceResult {
+  scope: 'session'
+  status: 'idle' | 'busy' | 'unknown'
+  admission: 'closed'
+  nonce: string
+  generation: string
+}
+export interface RuntimeQuiesceCancelParams {
+  session_id: string
+  nonce: string
+  generation: string
+}
+export interface RuntimeQuiesceCancelResult {
+  admission: 'open'
+  generation: string
+}
 export interface SystemBatteryParams {
   profile?: string | null
 }
@@ -4994,6 +5013,10 @@ export interface RpcMethods {
   'rollback.list': { params: RollbackListParams; result: RollbackListResult }
   /** Restore the working tree (or one file) to a checkpoint by hash or 1-based index. */
   'rollback.restore': { params: RollbackRestoreParams; result: RollbackRestoreResult }
+  /** Close admission for the calling transport's live session, never the process. */
+  'runtime.quiesce': { params: RuntimeQuiesceParams; result: RuntimeQuiesceResult }
+  /** Reopen session admission only with its current transport-bound receipt. */
+  'runtime.quiesce.cancel': { params: RuntimeQuiesceCancelParams; result: RuntimeQuiesceCancelResult }
   /** Attach the frontend to a live session without closing the previously focused one. */
   'session.activate': { params: SessionActivateParams; result: SessionActivateResult }
   /** Live sessions in this process, insertion order (not a DB browser). */
@@ -5308,6 +5331,8 @@ export const RPC_METHODS = [
   'rollback.diff',
   'rollback.list',
   'rollback.restore',
+  'runtime.quiesce',
+  'runtime.quiesce.cancel',
   'session.activate',
   'session.active_list',
   'session.branch',

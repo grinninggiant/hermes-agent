@@ -87,3 +87,6 @@ await build({
   logLevel: 'info',
 })
 console.log(`bundled ${guestPreloadOut}${isDev ? ' (dev)' : ''}`)
+
+// Offline maintenance ships independently of Electron startup and tsx.
+await import('./bundle-offline-cli.mjs')

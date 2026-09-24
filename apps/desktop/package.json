@@ -220,6 +220,10 @@
     "afterPack": "scripts/after-pack.mjs",
     "extraResources": [
       {
+        "from": "assets/trusted-runtime-manifests.json",
+        "to": "trusted-runtime-manifests.json"
+      },
+      {
         "from": "build/install-stamp.json",
         "to": "install-stamp.json"
       },

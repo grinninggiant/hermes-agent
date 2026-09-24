@@ -15047,7 +15047,7 @@ def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
         def delete_session(self, *a, **kw):
             raise AssertionError("delete must not run when active snapshot fails")
 
-    class _ExplodingDict:
+    class _ExplodingDict(dict):
         def values(self):
             raise RuntimeError("dictionary changed size during iteration")
 

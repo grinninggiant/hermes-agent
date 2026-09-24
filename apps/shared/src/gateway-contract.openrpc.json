@@ -2941,6 +2941,42 @@
       }
     },
     {
+      "name": "runtime.quiesce",
+      "summary": "Close admission for the calling transport's live session, never the process.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/RuntimeQuiesceParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/RuntimeQuiesceResult"
+        }
+      }
+    },
+    {
+      "name": "runtime.quiesce.cancel",
+      "summary": "Reopen session admission only with its current transport-bound receipt.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/RuntimeQuiesceCancelParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/RuntimeQuiesceCancelResult"
+        }
+      }
+    },
+    {
       "name": "session.activate",
       "summary": "Attach the frontend to a live session without closing the previously focused one.",
       "params": [
@@ -27176,6 +27212,105 @@
           "idempotent"
         ],
         "title": "RoomTombstone",
+        "type": "object"
+      },
+      "RuntimeQuiesceCancelParams": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "nonce": {
+            "title": "Nonce",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "nonce",
+          "generation"
+        ],
+        "title": "RuntimeQuiesceCancelParams",
+        "type": "object"
+      },
+      "RuntimeQuiesceCancelResult": {
+        "additionalProperties": false,
+        "properties": {
+          "admission": {
+            "const": "open",
+            "title": "Admission",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "admission",
+          "generation"
+        ],
+        "title": "RuntimeQuiesceCancelResult",
+        "type": "object"
+      },
+      "RuntimeQuiesceParams": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "RuntimeQuiesceParams",
+        "type": "object"
+      },
+      "RuntimeQuiesceResult": {
+        "additionalProperties": false,
+        "properties": {
+          "scope": {
+            "const": "session",
+            "title": "Scope",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "idle",
+              "busy",
+              "unknown"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "admission": {
+            "const": "closed",
+            "title": "Admission",
+            "type": "string"
+          },
+          "nonce": {
+            "title": "Nonce",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "status",
+          "admission",
+          "nonce",
+          "generation"
+        ],
+        "title": "RuntimeQuiesceResult",
         "type": "object"
       },
       "SecretRequestParams": {

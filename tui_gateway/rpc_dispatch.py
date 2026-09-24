@@ -7,11 +7,20 @@ from .method_ctx import bind_module
 
 def handle_request(req: dict) -> dict | None:
     from hermes_cli.backend_retirement import retirement
+    from . import process_admission
 
+    normalized = _normalize_request(req)
+    if isinstance(normalized, dict):
+        return normalized
     with retirement.work() as admitted:
         if not admitted:
             return _err(req.get("id"), 5035, "backend is retiring; reconnect to continue")
-        return _handle_admitted_request(req)
+        if not process_admission.admit(normalized[1]):
+            return _err(normalized[0], 4093, "process admission closed for runtime transition")
+        try:
+            return _handle_admitted_request(req)
+        finally:
+            process_admission.release()
 
 
 def _handle_admitted_request(req: dict) -> dict | None:
@@ -29,12 +38,16 @@ def _handle_admitted_request(req: dict) -> dict | None:
         params, problem = _contracts.validate_params(contract, params)
         if problem is not None:
             return _err(rid, 4000, problem)
+    admitted, refusal = _runtime_admit_rpc(rid, method, params)
+    if refusal is not None:
+        return refusal
     token = _current_rpc_method.set(method)
     try:
         response = fn(rid, params)
     except ProfileUnavailableError as exc:
         return _err(rid, 4064, str(exc))
     finally:
+        _runtime_release_rpc(admitted)
         _current_rpc_method.reset(token)
     if contract is not None and isinstance(response, dict) and isinstance(response.get("result"), dict):
         _contracts.check_params_accepted(contract, params)
@@ -53,8 +66,13 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
         from tui_gateway import server_requests
         if server_requests.is_response_frame(req):
             # The renderer answering one of OUR requests (clarify, approval, …): no response frame goes back.
-            if not server_requests.resolve_response(req) and not _relay_compute_host_response(req):
-                logger.debug("dropping response for unknown server request id=%r", req.get("id"))
+            from . import process_admission
+            process_admission.admit("server.response")
+            try:
+                if not server_requests.resolve_response(req) and not _relay_compute_host_response(req):
+                    logger.debug("dropping response for unknown server request id=%r", req.get("id"))
+            finally:
+                process_admission.release()
             return None
         normalized = _normalize_request(req)
         if isinstance(normalized, dict):
@@ -62,10 +80,14 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
         if normalized[1] not in _LONG_HANDLERS:
             return handle_request(req)
         from hermes_cli.backend_retirement import retirement
+        from . import process_admission
 
         # Reserve BEFORE enqueueing: a queued handler has accepted work even though no worker runs yet.
         if not retirement.acquire():
             return _err(req.get("id"), 5035, "backend is retiring; reconnect to continue")
+        if not process_admission.admit(normalized[1]):
+            retirement.release()
+            return _err(normalized[0], 4093, "process admission closed for runtime transition")
         try:
             ctx = contextvars.copy_context()  # the pool worker must see the bound transport
             owner = normalized[2].get("owner")
@@ -81,9 +103,11 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
                     t.write(resp)
             future = _pool.submit(lambda: ctx.run(run))
         except BaseException:
+            process_admission.release()
             retirement.release()
             raise
         # Also releases cancelled queued futures; the worker's own finally would never execute.
+        future.add_done_callback(lambda _: process_admission.release())
         future.add_done_callback(lambda _: retirement.release())
         return None
     finally:

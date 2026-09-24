@@ -16,9 +16,10 @@ from .method_ctx import bind_module
 def _session_turn_admission(session: dict):
     """Hold process admission until the history-locked running claim is visible to idle probes."""
     from hermes_cli.backend_retirement import retirement
+    from tui_gateway.process_admission import is_closed
 
     with retirement.work() as admitted, session["history_lock"]:
-        yield admitted
+        yield admitted and not session.get("_runtime_quiescence") and not is_closed()
 
 
 def _start_session_work(target, *, name: str, session: dict | None = None):

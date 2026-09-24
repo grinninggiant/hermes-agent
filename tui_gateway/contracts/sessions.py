@@ -5,6 +5,8 @@ listing/browsing stored rows, spawn-tree snapshots, event replay and the statele
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field
 
 from .base import JsonValue, Params, Result, WireEnum
@@ -728,3 +730,32 @@ class LlmOneshotResult(Result):
 
 method("llm.oneshot", params=LlmOneshotParams, result=LlmOneshotResult,
        doc="Stateless one-shot LLM completion (titles, ideas) on the session's or the task backend.")
+
+
+# Session receipts never grant process-owner authority.
+class RuntimeQuiesceParams(Params):
+    session_id: str
+
+
+class RuntimeQuiesceResult(Result):
+    scope: Literal["session"]
+    status: Literal["idle", "busy", "unknown"]
+    admission: Literal["closed"]
+    nonce: str
+    generation: str
+
+
+class RuntimeQuiesceCancelParams(RuntimeQuiesceParams):
+    nonce: str
+    generation: str
+
+
+class RuntimeQuiesceCancelResult(Result):
+    admission: Literal["open"]
+    generation: str
+
+
+method("runtime.quiesce", params=RuntimeQuiesceParams, result=RuntimeQuiesceResult,
+       doc="Close admission for the calling transport's live session, never the process.")
+method("runtime.quiesce.cancel", params=RuntimeQuiesceCancelParams, result=RuntimeQuiesceCancelResult,
+       doc="Reopen session admission only with its current transport-bound receipt.")

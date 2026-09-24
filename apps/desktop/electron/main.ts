@@ -6,6 +6,41 @@ import https from 'node:https'
 import os from 'node:os'
 import path from 'node:path'
 import tls from 'node:tls'
+
+import { parseStoredRegistry } from './connection-registry'
+import { assertBundleReady, writeConnectionsRegistry } from './connection-registry-store'
+import { resolveConnectionRuntime } from './connection-runtime'
+import { attachProcessOwner, ownerLaunchArgs, type ProcessOwner } from './process-owner'
+import { RuntimeTransitionController, RuntimeTransitionJournal, type TransitionOwner } from './runtime-transition'
+import { startupEffects } from './startup-effects'
+
+// Native-only; never included in backend connection DTOs or renderer IPC.
+const nativeProcessOwners = new WeakMap<object, ProcessOwner>()
+let nativeGeneralTransitionOwner: TransitionOwner | null = null
+
+function registerNativeProcessOwner(child: ReturnType<typeof spawn>): void {
+  const channel = attachProcessOwner(child, () => nativeProcessOwners.delete(child))
+  nativeProcessOwners.set(child, channel)
+  nativeGeneralTransitionOwner = {
+    identity: child,
+    channel,
+    exited: () => child.exitCode !== null || child.signalCode !== null
+  }
+}
+
+function privateOwnerArgs(backend): string[] | null {
+  if (
+    process.platform === 'win32' ||
+    backend.shell ||
+    !backend.root ||
+    !fs.existsSync(path.join(backend.root, 'tui_gateway', 'owner_bootstrap.py'))
+  ) {
+    return null
+  }
+
+  return ownerLaunchArgs(backend.args)
+}
+
 import { pathToFileURL } from 'node:url'
 
 import {
@@ -964,6 +999,41 @@ const DESKTOP_CONNECTION_CONFIG_PATH = path.join(app.getPath('userData'), 'conne
 // profile keep working; the registry imports from it once and then owns its
 // own file. Same secret posture as connection.json (encrypted tokens, 0600).
 const DESKTOP_CONNECTIONS_REGISTRY_PATH = path.join(app.getPath('userData'), 'connections.json')
+
+// No migration, mode tightening or drift healing while inspecting a transition.
+// The existing registry writer remains the only settings writer.
+const nativeRuntimeTransition = new RuntimeTransitionController({
+  store: {
+    read: () => {
+      assertNoOfflineMaintenance()
+      assertBundleReady(app.getPath('userData'))
+
+      try {
+        return parseStoredRegistry(fs.readFileSync(DESKTOP_CONNECTIONS_REGISTRY_PATH, 'utf8'))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT' && !connectionRegistryCache) {
+          return normalizeRegistry(null)
+        }
+
+        throw error
+      }
+    },
+    write: writeDesktopConnectionsRegistry
+  },
+  journal: new RuntimeTransitionJournal(path.join(app.getPath('userData'), 'runtime-transition.json')),
+  trusted: () => {
+    const pins: { manifestSha256: string }[] = JSON.parse(
+      fs.readFileSync(path.join(process.resourcesPath, 'trusted-runtime-manifests.json'), 'utf8')
+    )
+
+    return new Set(pins.map(pin => pin.manifestSha256))
+  },
+  owner: () => nativeGeneralTransitionOwner,
+  // Until native graceful exit accounts for legacy/unowned/pending starts,
+  // absence is not proven. Never convert idle into permission to signal.
+  backendState: () => (nativeGeneralTransitionOwner && !nativeGeneralTransitionOwner.exited() ? 'alive' : 'unknown')
+})
+
 const DESKTOP_INSTALLATION_PATH = path.join(app.getPath('userData'), 'desktop-installation.json')
 const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.json')
 const DESKTOP_UPDATE_CHECK_CACHE_PATH = path.join(app.getPath('userData'), 'update-check-cache.json')
@@ -3346,7 +3416,11 @@ async function resolveHealedBranch(updateRoot, branch) {
 // update changes HEAD, which busts the cache immediately). `git fetch` runs only
 // inside applyUpdates. `force` (menu item, Settings "Check now") skips the
 // cache; the renderer's background poller never passes it.
-async function checkUpdates({ force = false }: { force?: boolean } = {}) {
+async function checkUpdates(options: { force?: boolean } = {}) {
+  return startupEffects.checkForUpdates(() => checkUpdatesExternal(options))
+}
+
+async function checkUpdatesExternal({ force = false }: { force?: boolean } = {}) {
   const updateRoot = resolveUpdateRoot()
   let { branch } = readDesktopUpdateConfig()
   const gitDir = path.join(updateRoot, '.git')
@@ -3760,6 +3834,10 @@ function killHermesOwnedVenvDaemons(updateRoot) {
 // not a process-group leader — a POSIX negative-pgid kill would be meaningless
 // here anyway). POSIX teardown stays with the existing before-quit SIGTERM.
 function forceKillProcessTree(pid) {
+  return startupEffects.stopBackend(() => forceKillProcessTreeExternal(pid))
+}
+
+function forceKillProcessTreeExternal(pid) {
   if (!IS_WINDOWS) {
     return
   }
@@ -3868,6 +3946,10 @@ async function backendParentMatches(entry) {
 }
 
 async function stopOwnedBackend(identity) {
+  return startupEffects.stopBackend(() => stopOwnedBackendExternal(identity))
+}
+
+async function stopOwnedBackendExternal(identity) {
   const matches = await processIdentityMatches(identity, REAP_PROBE_TIMEOUT_MS)
 
   if (matches === false) {
@@ -4033,6 +4115,10 @@ function releaseBackendChild(child) {
 }
 
 function reapOrphanedBackendsOnce() {
+  return startupEffects.reapBackends(reapOrphanedBackendsExternal)
+}
+
+function reapOrphanedBackendsExternal() {
   if (!backendOrphanReapPromise) {
     backendOrphanReapPromise = backendOwnership
       .reapOrphans()
@@ -5282,7 +5368,44 @@ async function createActiveBackend(backendArgs) {
   }
 }
 
-async function resolveHermesBackend(backendArgs) {
+async function resolveHermesBackend(backendArgs, runtimeProfile?: string) {
+  // Only local serve callers opt in; CLI helpers and gateway resolution stay unchanged.
+  if (runtimeProfile === 'general') {
+    assertBundleReady(app.getPath('userData'))
+    const registry = readDesktopConnectionsRegistry()
+    const selected = registry.connections.find(c => c.id === 'local')?.generalRuntime?.coordinate
+
+    if (selected) {
+      // Distribution-owned pins, not settings/renderer-supplied trust assertions.
+      const pinsPath = path.join(process.resourcesPath, 'trusted-runtime-manifests.json')
+      const pins: { commit: string; manifestSha256: string }[] = JSON.parse(fs.readFileSync(pinsPath, 'utf8'))
+
+      const coordinate = resolveConnectionRuntime(
+        registry,
+        'local',
+        runtimeProfile,
+        new Set(pins.filter(pin => pin.commit === selected.commit).map(pin => pin.manifestSha256))
+      )!
+
+      const venvRoot = path.dirname(path.dirname(coordinate.python))
+
+      return {
+        kind: 'python',
+        label: `Hermes release ${coordinate.commit}`,
+        command: coordinate.python,
+        args: ['-m', 'hermes_cli.main', ...backendArgs],
+        env: buildDesktopBackendEnv({
+          hermesHome: HERMES_HOME,
+          pythonPathEntries: [coordinate.agentRoot, ...getVenvSitePackagesEntries(venvRoot)],
+          venvRoot
+        }),
+        root: coordinate.agentRoot,
+        bootstrap: false,
+        shell: false
+      }
+    }
+  }
+
   // 1. Explicit override -- HERMES_DESKTOP_HERMES_ROOT points at a developer
   //    checkout. Honour it as-is (no bootstrap; the user is driving).
   const overrideRoot = process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT)
@@ -9493,7 +9616,11 @@ function readDesktopConnectionsRegistry() {
 
   try {
     mtime = fs.statSync(DESKTOP_CONNECTIONS_REGISTRY_PATH).mtimeMs
-  } catch {
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || connectionRegistryCache) {
+      throw new Error('Connections registry unavailable; previous runtime selection retained', { cause: error })
+    }
+
     mtime = null
   }
 
@@ -9528,15 +9655,10 @@ function readDesktopConnectionsRegistry() {
     // Same rationale as connection.json: tighten BEFORE parse so a corrupt
     // file that still holds token bytes gets its mode fixed anyway.
     tightenSecretFileMode(DESKTOP_CONNECTIONS_REGISTRY_PATH)
-    registry = normalizeRegistry(JSON.parse(fs.readFileSync(DESKTOP_CONNECTIONS_REGISTRY_PATH, 'utf8')))
-  } catch {
-    // Whole-file corruption (truncated write, mangled hand-edit). The
-    // degraded local-only registry keeps boot working, but the file BYTES are
-    // the user's connection data — preserve them in a sidecar BEFORE any
-    // later write (drift reconcile, connection save) overwrites the file
-    // (#94246: recovery must never be data loss).
-    preserveCorruptRegistrySidecar()
-    registry = normalizeRegistry(null)
+    registry = parseStoredRegistry(fs.readFileSync(DESKTOP_CONNECTIONS_REGISTRY_PATH, 'utf8'))
+  } catch (error) {
+    // Leave the bytes and last valid cache untouched; no migration, drift write or spawn.
+    throw new Error('Connections registry invalid; previous runtime selection retained', { cause: error })
   }
 
   if (registry?.quarantined?.length) {
@@ -9573,36 +9695,27 @@ function readDesktopConnectionsRegistry() {
   return registry
 }
 
-// Copy an unparseable connections.json aside (once per corruption event) so a
-// later registry write can never destroy the only copy of the user's saved
-// connections (#94246). Best effort: failure to preserve must not block boot.
-function preserveCorruptRegistrySidecar() {
+function assertNoOfflineMaintenance() {
   try {
-    const rawText = fs.readFileSync(DESKTOP_CONNECTIONS_REGISTRY_PATH, 'utf8')
-
-    if (!rawText.trim()) {
+    fs.lstatSync(path.join(app.getPath('userData'), 'runtime-maintenance.lock'))
+  } catch (error) {
+    if (error.code === 'ENOENT') {
       return
     }
 
-    const sidecar = `${DESKTOP_CONNECTIONS_REGISTRY_PATH}.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}`
-
-    if (!fs.existsSync(sidecar)) {
-      fs.writeFileSync(sidecar, rawText, { mode: 0o600 })
-    }
-
-    rememberLog(
-      `[connections] connections.json could not be parsed; preserved the original file at ${sidecar} and continuing with a local-only registry. No connection data was deleted.`
-    )
-  } catch {
-    // The read itself failed (missing file, permissions) — nothing to save.
+    throw error
   }
+
+  throw new Error('Closed-app runtime maintenance owns the registry; keep Desktop closed')
 }
 
 function writeDesktopConnectionsRegistry(registry) {
+  assertNoOfflineMaintenance()
+  assertBundleReady(app.getPath('userData'))
   fs.mkdirSync(path.dirname(DESKTOP_CONNECTIONS_REGISTRY_PATH), { recursive: true })
   // Owner-only for the same reason as connection.json: entries carry
   // safeStorage-encrypted tokens plus URLs and SSH host/user/keyPath.
-  writeSecretFileAtomic(DESKTOP_CONNECTIONS_REGISTRY_PATH, JSON.stringify(registry, null, 2))
+  writeConnectionsRegistry(DESKTOP_CONNECTIONS_REGISTRY_PATH, registry)
   connectionRegistryCache = registry
   connectionRegistryCacheMtime = fs.statSync(DESKTOP_CONNECTIONS_REGISTRY_PATH).mtimeMs
 }
@@ -11310,7 +11423,9 @@ function resetBootProgressForReconnect() {
 }
 
 function stopBackendChild(child) {
-  void localBackendLifecycle.stop(child).catch(error => rememberLog(`Backend teardown failed: ${error.message}`))
+  return startupEffects.stopBackend(() => {
+    void localBackendLifecycle.stop(child).catch(error => rememberLog(`Backend teardown failed: ${error.message}`))
+  })
 }
 
 // Soft gateway-mode apply: tear down the primary without resetting boot UI or
@@ -11440,6 +11555,9 @@ function profileRouteOptions(profile, request?) {
     // its own backend; absent entries inherit the primary's remote.
     ownEntry: Boolean((config.profiles || {})[key]),
     isolatedBackend: ISOLATED_BACKEND,
+    exactLocalRuntime:
+      (key === 'general' || primaryProfileKey() === 'general') &&
+      Boolean(readDesktopConnectionsRegistry().connections.find(c => c.id === 'local')?.generalRuntime?.coordinate),
     requestMethod: request?.method,
     requestPath: request?.path
   }
@@ -11456,6 +11574,10 @@ async function ensureBackend(
     spawnPriority?: LocalBackendSpawnPriority
   } = {}
 ) {
+  return startupEffects.startBackend(() => ensureBackendExternal(profile, opts))
+}
+
+async function ensureBackendExternal(profile, opts: Parameters<typeof ensureBackend>[1] = {}) {
   localBackendLifecycle.assertCanStart()
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
   const spawnPriority = spawnPriorityFrom(opts.spawnPriority)
@@ -12697,8 +12819,9 @@ async function runPoolBackendStart(
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
   const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
+  const runtimeStartTicket = profile === 'general' ? nativeRuntimeTransition.startTicket() : null
 
-  const backend = await ensureRuntime(await resolveHermesBackend(backendArgs), () =>
+  const backend = await ensureRuntime(await resolveHermesBackend(backendArgs, profile), () =>
     assertPoolEntryStillOwned(poolKey, entry)
   )
 
@@ -12724,9 +12847,15 @@ async function runPoolBackendStart(
   const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
   assertPoolEntryStillOwned(poolKey, entry)
 
+  const ownerArgs = privateOwnerArgs(backend)
+
+  if (runtimeStartTicket) {
+    nativeRuntimeTransition.assertStart(runtimeStartTicket)
+  }
+
   const child = spawnOwnedBackend(
     backend.command,
-    backend.args,
+    ownerArgs ?? backend.args,
     hiddenWindowsChildOptions({
       cwd: hermesCwd,
       env: desktopBackendSpawnEnv(
@@ -12753,9 +12882,13 @@ async function runPoolBackendStart(
         GUEST_ONBOARDING
       ),
       shell: backend.shell,
-      stdio: ['ignore', 'pipe', 'pipe']
+      stdio: ownerArgs ? ['ignore', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe']
     })
   )
+
+  if (ownerArgs) {
+    registerNativeProcessOwner(child)
+  }
 
   entry.process = child
   entry.token = token
@@ -12811,7 +12944,7 @@ async function runPoolBackendStart(
   })
 
   portAnnouncement.catch(() => {})
-  await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce, outputTail)
+  await claimBackendChild(child, `${backend.command} ${(ownerArgs ?? backend.args).join(' ')}`, profile, backendNonce, outputTail)
   assertPoolEntryStillOwned(poolKey, entry, { releaseSlot: false })
 
   child.stdout.on('data', rememberLog)
@@ -13176,7 +13309,7 @@ function startHermes({ supervisorRecovery = false }: { supervisorRecovery?: bool
   primaryRecoverySuppressed = false
   primaryStartsInFlight += 1
 
-  const start = localBackendLifecycle.start(() => runHermesStart({ supervisorRecovery }))
+  const start = startupEffects.startBackend(() => localBackendLifecycle.start(() => runHermesStart({ supervisorRecovery })))
 
   const releaseStart = () => {
     primaryStartsInFlight -= 1
@@ -13418,17 +13551,23 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
       backendArgs.unshift('--profile', activeProfile)
     }
 
+    let runtimeStartTicket: ReturnType<RuntimeTransitionController['startTicket']> | null = null
+
     const setup = await runPrimaryBackendStartup({
       signal: localBackendLifecycle.signal,
       assertCurrentAttempt: () => backendConnectionState.assertCurrentAttempt(connectionAttempt),
-      attachHostBackend: attachToRunningHostBackend,
+      attachHostBackend: () =>
+        activeProfile === 'general'
+          ? nativeRuntimeTransition.attachHostBackend(attachToRunningHostBackend)
+          : attachToRunningHostBackend(),
       connectRemote,
       ensureLocalRuntime: backend =>
         ensureRuntime(backend, () => backendConnectionState.assertCurrentAttempt(connectionAttempt)),
       prepareLocalBackend: async () => {
         await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
+        runtimeStartTicket = activeProfile === 'general' ? nativeRuntimeTransition.startTicket() : null
 
-        return resolveHermesBackend(backendArgs)
+        return resolveHermesBackend(backendArgs, activeProfile)
       },
       resolveRemote: () => {
         // Classify immediately before each throwing resolve. This callback runs
@@ -13507,11 +13646,17 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
     const backendNonce = crypto.randomBytes(16).toString('hex')
     const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
 
+    const ownerArgs = privateOwnerArgs(backend)
+
+    if (runtimeStartTicket) {
+      nativeRuntimeTransition.assertStart(runtimeStartTicket)
+    }
+
     backendConnectionState.assertCurrentAttempt(connectionAttempt)
 
     const hermesProcess = spawnOwnedBackend(
       backend.command,
-      backend.args,
+      ownerArgs ?? backend.args,
       hiddenWindowsChildOptions({
         cwd: hermesCwd,
         env: desktopBackendSpawnEnv(
@@ -13543,9 +13688,13 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
           GUEST_ONBOARDING
         ),
         shell: backend.shell,
-        stdio: ['ignore', 'pipe', 'pipe']
+        stdio: ownerArgs ? ['ignore', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe']
       })
     )
+
+    if (ownerArgs) {
+      registerNativeProcessOwner(hermesProcess)
+    }
 
     // Buffer stdout+stderr from the instant of spawn (#93608): an early
     // crash's traceback must survive into the claim error and the
@@ -13573,7 +13722,7 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
     portAnnouncement.catch(() => {})
     await claimBackendChild(
       hermesProcess,
-      `${backend.command} ${backend.args.join(' ')}`,
+      `${backend.command} ${(ownerArgs ?? backend.args).join(' ')}`,
       profile,
       backendNonce,
       primaryOutputTail
@@ -18795,7 +18944,7 @@ app.on('open-url', (event, url) => {
 app.whenReady().then(() => {
   // Warm the login-shell PATH resolution immediately so it usually completes
   // before the backend start path awaits the same single-flight promise.
-  void ensureLoginShellPath()
+  startupEffects.warmShell(() => void ensureLoginShellPath())
 
   if (CRASH_DIAGNOSTICS) {
     startChromiumLogWatcher(CHROMIUM_LOG_PATH)
@@ -18832,7 +18981,7 @@ app.whenReady().then(() => {
   registerMediaProtocol()
   installEmbedReferer()
   installRemoteHeaderRules()
-  registerDeepLinkProtocol()
+  startupEffects.registerProtocol(registerDeepLinkProtocol)
   installPreviewGuestPreload()
 
   ensureWslWindowsFonts()
@@ -18850,15 +18999,17 @@ app.whenReady().then(() => {
   // Quick Entry's global chord — registered on ready so a cold launch restores
   // it without the renderer visiting Settings. A failed registration is logged
   // here and surfaced in Settings via the IPC state (never silent).
-  applyQuickEntrySettings(readQuickEntrySettings())
-  installCommandScreenshot({ rendererUrl: DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString() })
-  installHudModifierTap({
-    rendererUrl: DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString(),
-    summon: () => {
-      if (!isQuittingForHandoff && !backendShutdown.hasStarted()) {
-        openHudWindow(null, null)
+  startupEffects.integrateDesktop(() => {
+    applyQuickEntrySettings(readQuickEntrySettings())
+    installCommandScreenshot({ rendererUrl: DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString() })
+    installHudModifierTap({
+      rendererUrl: DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString(),
+      summon: () => {
+        if (!isQuittingForHandoff && !backendShutdown.hasStarted()) {
+          openHudWindow(null, null)
+        }
       }
-    }
+    })
   })
 
   if (IS_MAC) {
@@ -18887,7 +19038,7 @@ app.whenReady().then(() => {
   // serves were drained. The owner-only recovery journal survives that crash;
   // its worker waits for the install marker to clear, then reopens every scope
   // captured by the original transaction before removing the journal entry.
-  void resumeManagedSshRecoveries()
+  startupEffects.recoverStartup(() => void resumeManagedSshRecoveries())
   installApplicationMenuAfterFirstWindow({
     isMac: IS_MAC,
     buildMenu: buildApplicationMenu,

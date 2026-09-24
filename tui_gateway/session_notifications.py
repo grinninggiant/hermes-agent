@@ -704,53 +704,65 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
     handle = lambda events, deferred: _notif_handle_ready(  # noqa: E731
         sid, session, events, emitted, process_registry, format_process_notification, deferred)
     last_kanban_poll = last_loop_poll = last_bot_poll = 0.0
+    from tui_gateway import process_admission
     while not stop_event.is_set() and not session.get("_finalized"):
-        now = time.monotonic()
-        # Completions whose owner process died after this one started (#97202); throttled per profile home.
-        async_delegation.maybe_sweep_orphaned_completions(queue)
-        if now - last_bot_poll >= _BOT_DELIVERY_POLL_SECONDS:  # bot DM → live-owner delivery latency ≤ 5 s
-            last_bot_poll = now
-            _poll_bot_live_delivery_guarded(sid, session, now)
-        # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
-        # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
-        if now - last_loop_poll >= _LOOP_POLL_SECONDS:
-            last_loop_poll = now
-            for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick)):
-                try:
-                    fire(sid, session)
-                except Exception as tick_exc:
-                    _notif_log_failure(f"{what} poll failed", tick_exc)
-        if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
-            last_kanban_poll = now
-            _notif_poll_kanban(sid, session)
-        try:
-            evt = queue.get(timeout=0.5)
-        except Exception:
+        if not process_admission.admit():
+            stop_event.wait(0.5)
             continue
-        ready = [evt]
+        try:
+            now = time.monotonic()
+            # Completions whose owner process died after this one started (#97202); throttled per profile home.
+            async_delegation.maybe_sweep_orphaned_completions(queue)
+            if now - last_bot_poll >= _BOT_DELIVERY_POLL_SECONDS:  # bot DM → live-owner delivery latency ≤ 5 s
+                last_bot_poll = now
+                _poll_bot_live_delivery_guarded(sid, session, now)
+            # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
+            # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
+            if now - last_loop_poll >= _LOOP_POLL_SECONDS:
+                last_loop_poll = now
+                for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick)):
+                    try:
+                        fire(sid, session)
+                    except Exception as tick_exc:
+                        _notif_log_failure(f"{what} poll failed", tick_exc)
+            if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
+                last_kanban_poll = now
+                _notif_poll_kanban(sid, session)
+            try:
+                evt = queue.get(timeout=0.5)
+            except Exception:
+                continue
+            ready = [evt]
+            for _ in range(queue.qsize()):
+                try:
+                    ready.append(queue.get_nowait())
+                except Exception:
+                    break
+            try:
+                handle(ready, None)
+            except Exception as exc:
+                # This thread is the session's only path to notifications, /loop, /heartbeat and its
+                # bot mailbox; one bad event must not end all four.
+                _notif_log_failure("notification dispatch failed", exc)
+        finally:
+            process_admission.release()
+    # Drain remaining events after the stop signal so nothing is lost on shutdown; foreign and orphaned-delegation
+    # events are handed back to the shared queue afterwards.
+    if not process_admission.admit():
+        return  # Keep pending events queued; never consume them behind the fence.
+    try:
+        deferred: list = []
+        ready = []
         for _ in range(queue.qsize()):
             try:
                 ready.append(queue.get_nowait())
             except Exception:
                 break
-        try:
-            handle(ready, None)
-        except Exception as exc:
-            # This thread is the session's only path to notifications, /loop, /heartbeat and its
-            # bot mailbox; one bad event must not end all four.
-            _notif_log_failure("notification dispatch failed", exc)
-    # Drain remaining events after the stop signal so nothing is lost on shutdown; foreign and orphaned-delegation
-    # events are handed back to the shared queue afterwards.
-    deferred: list = []
-    ready = []
-    for _ in range(queue.qsize()):
-        try:
-            ready.append(queue.get_nowait())
-        except Exception:
-            break
-    handle(ready, deferred)
-    for evt in deferred:
-        queue.put(evt)
+        handle(ready, deferred)
+        for evt in deferred:
+            queue.put(evt)
+    finally:
+        process_admission.release()
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:

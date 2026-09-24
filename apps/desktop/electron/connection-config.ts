@@ -564,6 +564,8 @@ export interface ProfileRouteOptions {
   ownEntry?: boolean
   /** `HERMES_DESKTOP_ISOLATED_BACKEND=1`: opt out of the host singleton. */
   isolatedBackend?: boolean
+  /** A selected local release must not serve, or be served by, another profile's runtime. */
+  exactLocalRuntime?: boolean
   requestMethod?: null | string
   requestPath?: null | string
 }
@@ -828,6 +830,10 @@ function resolveProfileBackendRoute(profile, opts: ProfileRouteOptions = {}): Pr
 
     // A stored local profile must not be redirected into the remote primary,
     // even when its REST endpoint supports profile scoping.
+    return { backend: 'pool', descriptorProfile: null, scopePath: false }
+  }
+
+  if (opts.exactLocalRuntime) {
     return { backend: 'pool', descriptorProfile: null, scopePath: false }
   }
 
