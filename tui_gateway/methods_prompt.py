@@ -507,6 +507,8 @@ def _lock_in_submit_turn(
     cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
     fields = {}
     with session["history_lock"]:
+        if session.get("_runtime_quiescence"):
+            return _err(rid, 4093, "session admission closed for runtime transition"), fields
         # A watch session's run lives in the PARENT turn (own running flag False); typing
         # mid-run would build a second agent racing the child on the same stored session.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):

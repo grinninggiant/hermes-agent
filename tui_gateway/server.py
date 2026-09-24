@@ -741,16 +741,33 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
 
 
 def handle_request(req: dict) -> dict | None:
+    from . import process_admission
+    normalized = _normalize_request(req)
+    if isinstance(normalized, dict):
+        return normalized
+    if not process_admission.admit(normalized[1]):
+        return _err(normalized[0], 4093, "process admission closed for runtime transition")
+    try:
+        return _handle_admitted_request(req)
+    finally:
+        process_admission.release()
+
+
+def _handle_admitted_request(req: dict) -> dict | None:
     normalized = _normalize_request(req)
     if isinstance(normalized, dict):
         return normalized
     rid, method, params = normalized
     if not (fn := _methods.get(method)):
         return _err(rid, -32601, f"unknown method: {method}")
+    admitted, refusal = _runtime_admit_rpc(rid, method, params)
+    if refusal is not None:
+        return refusal
     token = _current_rpc_method.set(method)
     try:
         return fn(rid, params)
     finally:
+        _runtime_release_rpc(admitted)
         _current_rpc_method.reset(token)
 
 
@@ -787,16 +804,25 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
         if normalized[1] not in _LONG_HANDLERS:
             return handle_request(req)
+        from . import process_admission
+        if not process_admission.admit(normalized[1]):
+            return _err(normalized[0], 4093, "process admission closed for runtime transition")
         ctx = contextvars.copy_context()  # the pool worker must see the bound transport
 
         def run():
             try:
-                resp = handle_request(req)
+                resp = _handle_admitted_request(req)
             except Exception as exc:
                 resp = _err(req.get("id"), -32000, f"handler error: {exc}")
             if resp is not None:
                 t.write(resp)
-        _pool.submit(lambda: ctx.run(run))
+        try:
+            future = _pool.submit(lambda: ctx.run(run))
+        except BaseException:
+            process_admission.release()
+            raise
+        # Also releases requests cancelled while still queued, before run starts.
+        future.add_done_callback(lambda _future: process_admission.release())
         return None
     finally:
         reset_transport(token)
@@ -3213,7 +3239,8 @@ from . import (  # noqa: E402
     methods_profiles as _methods_profiles, methods_prompt as _methods_prompt, methods_session as _methods_session,
     methods_tools as _methods_tools, prompt_turn as _prompt_turn, billing_view as _billing_view,
     methods_projects as _methods_projects, methods_session_foreign as _methods_session_foreign,
-    methods_session_control as _methods_session_control, methods_subagents as _methods_subagents)
+    methods_session_control as _methods_session_control, methods_subagents as _methods_subagents,
+    methods_runtime as _methods_runtime)
 
 for _m in (
     _session_transports, _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
@@ -3223,6 +3250,6 @@ for _m in (
     _methods_browser_control, _methods_session, _methods_prompt, _methods_config,
     _methods_config_set, _methods_complete, _methods_tools, _methods_profiles, _methods_images,
     _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects, _methods_session_foreign,
-    _methods_session_control, _methods_subagents):
+    _methods_session_control, _methods_subagents, _methods_runtime):
     _m.register(sys.modules[__name__])
 del _m

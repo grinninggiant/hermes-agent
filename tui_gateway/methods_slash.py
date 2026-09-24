@@ -98,7 +98,7 @@ def _format_live_commission_output(sid: str, session: dict, arg: str) -> str:
         current_transport_, current_owner = _current_session_steer_authority(sid)
         if current_transport_ is None or current_owner is not session or session.get("_closing"):
             return "session not found or not owned by this transport"
-        if session.get("running"):
+        if session.get("_runtime_quiescence") or session.get("running"):
             return "session busy — wait for the current turn to finish"
         session["running"] = True
         session["_run_thread"] = threading.current_thread()
