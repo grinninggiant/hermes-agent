@@ -289,10 +289,6 @@ class TestPostStopInterruptSwallow:
         runner.adapters = {}
         runner._pending_messages = {}
 
-        invalidated = []
-        runner._invalidate_session_run_generation = (
-            lambda key, reason=None: invalidated.append((key, reason))
-        )
         released = []
         runner._release_running_agent_state = (
             lambda key, **kw: released.append(key)

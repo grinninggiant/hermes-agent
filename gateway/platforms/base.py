@@ -1839,6 +1839,24 @@ class BasePlatformAdapter(ABC):
         """
         return notice
 
+    async def allow_execution(self, event: MessageEvent) -> bool:
+        """Veto an external or internal turn at the final worker admission boundary.
+
+        Default-allow, independent of the internal-only policy below. Overrides must
+        recheck their local ownership fence after any awaits; control commands do not
+        enter this boundary. Exceptions fail closed.
+        """
+        return True
+
+    async def _execution_allowed(self, event: MessageEvent) -> bool:
+        if not await self._internal_execution_allowed(event):
+            return False
+        try:
+            return (await self.allow_execution(event)) is not False
+        except Exception as exc:
+            logger.error("[%s] allow_execution failed closed: %s", self.name, exc, exc_info=True)
+            return False
+
     async def allow_internal_execution(self, event: Any) -> bool:
         """Return whether an admitted internal event may enter its message handler.
 

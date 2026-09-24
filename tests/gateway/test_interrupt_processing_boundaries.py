@@ -34,7 +34,7 @@ async def test_public_interrupt_session_processing_uses_native_session_funnel():
         session_key=session_key,
         session_id="session-1",
     )
-    runner._interrupt_and_clear_session = AsyncMock()
+    runner._interrupt_and_clear_session = AsyncMock(return_value=True)
 
     assert await runner.interrupt_session_processing(
         source, reason="platform_stop", expected_session_id="session-1",
@@ -44,6 +44,7 @@ async def test_public_interrupt_session_processing_uses_native_session_funnel():
         source,
         interrupt_reason="platform_stop",
         invalidation_reason="platform_stop",
+        expected_run_generation=0,
     )
 
 
@@ -74,7 +75,7 @@ async def test_recursive_internal_turn_is_rejected_before_worker_when_veto_flips
     runner = object.__new__(GatewayRunner)
     runner._profile_scope_for_source = lambda _source: nullcontext()
     runner._adapter_for_source = lambda _source: type(
-        "Adapter", (), {"_internal_execution_allowed": AsyncMock(return_value=False)}
+        "Adapter", (), {"_execution_allowed": AsyncMock(return_value=False)}
     )()
     runner._run_agent_inner = AsyncMock(side_effect=AssertionError("worker launched"))
 
@@ -101,7 +102,7 @@ async def test_recursive_internal_turn_is_rejected_for_mismatched_pinned_session
     runner = object.__new__(GatewayRunner)
     runner._profile_scope_for_source = lambda _source: nullcontext()
     runner._adapter_for_source = lambda _source: type(
-        "Adapter", (), {"_internal_execution_allowed": AsyncMock(return_value=True)}
+        "Adapter", (), {"_execution_allowed": AsyncMock(return_value=True)}
     )()
     runner._session_key_for_source = lambda _source: session_key
     runner.session_store = object()

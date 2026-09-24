@@ -2507,6 +2507,7 @@ class GatewayTurnMixin:
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: "SessionSource", session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, event_message_id: Optional[str] = None,
+        gateway_event: Any = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of running a local AIAgent.
 
@@ -2575,6 +2576,12 @@ class GatewayTurnMixin:
         full_response = ""
         _start = time.time()
         try:
+            rejection = await self._run_agent_preflight(
+                source=source, session_id=session_id, history=history,
+                gateway_event=gateway_event, session_key=session_key, run_generation=run_generation,
+            )
+            if rejection is not None:
+                return rejection
             _timeout = ClientTimeout(total=0, sock_read=1800)
             async with _AioClientSession(timeout=_timeout) as session:
                 async with session.post(f"{proxy_url}/v1/chat/completions", json=body, headers=headers) as resp:
@@ -2654,6 +2661,7 @@ class GatewayTurnMixin:
                 source=source, session_id=session_id, history=history,
                 gateway_event=turn_kwargs.get("gateway_event"),
                 session_key=turn_kwargs.get("session_key"),
+                run_generation=turn_kwargs.get("run_generation"),
             )
             if rejection is not None:
                 return rejection
@@ -2661,43 +2669,39 @@ class GatewayTurnMixin:
 
     async def _run_agent_preflight(
         self, *, source: SessionSource, session_id: str, history: List[Dict[str, Any]],
-        gateway_event: Any, session_key: Optional[str],
+        gateway_event: Any, session_key: Optional[str], run_generation: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Apply internal wake veto and strict session binding immediately before worker launch."""
-        if gateway_event is None or not bool(getattr(gateway_event, "internal", False)):
-            return None
+        """Recheck policy and exact run ownership after all awaited admission reads."""
+        def rejected(reason: str) -> Dict[str, Any]:
+            return {
+                "final_response": None, "messages": history, "interrupted": True,
+                "completed": False, "turn_exit_reason": reason, "session_id": session_id,
+            }
 
         adapter = self._adapter_for_source(source)
-        allowed = getattr(adapter, "_internal_execution_allowed", None)
+        allowed = getattr(adapter, "_execution_allowed", None) if gateway_event is not None else None
+        veto_kind = "internal_execution" if getattr(gateway_event, "internal", False) else "execution"
         if callable(allowed) and not await allowed(gateway_event):
-            gateway_event._gateway_rejection_reason = "internal_execution_veto"
-            return {
-                "final_response": None,
-                "messages": history,
-                "interrupted": True,
-                "completed": False,
-                "turn_exit_reason": "internal_execution_rejected",
-                "session_id": session_id,
-            }
-
+            gateway_event._gateway_rejection_reason = f"{veto_kind}_veto"
+            return rejected(f"{veto_kind}_rejected")
         metadata = getattr(gateway_event, "metadata", None) or {}
-        if not bool(metadata.get("gateway_session_strict")):
-            return None
-        expected_key = str(metadata.get("gateway_session_key") or "").strip()
-        pinned_id = str(metadata.get("gateway_session_id") or "").strip()
-        if not expected_key or self._session_key_for_source(source) != expected_key:
-            self._reject_strict_session_event(gateway_event, "expected_session_key_mismatch")
-            return {
-                "final_response": None, "messages": history, "interrupted": True,
-                "completed": False, "turn_exit_reason": "strict_session_rejected", "session_id": session_id,
-            }
-        current_entry = await self.async_session_store.lookup_by_session_key(expected_key)
-        if current_entry is None or not pinned_id or current_entry.session_id != pinned_id:
-            self._reject_strict_session_event(gateway_event, "strict_session_identity_mismatch")
-            return {
-                "final_response": None, "messages": history, "interrupted": True,
-                "completed": False, "turn_exit_reason": "strict_session_rejected", "session_id": session_id,
-            }
+        if bool(metadata.get("gateway_session_strict")):
+            expected_key = str(metadata.get("gateway_session_key") or "").strip()
+            pinned_id = str(metadata.get("gateway_session_id") or "").strip()
+            if not expected_key or self._session_key_for_source(source) != expected_key:
+                self._reject_strict_session_event(gateway_event, "expected_session_key_mismatch")
+                return rejected("strict_session_rejected")
+            current_entry = await self.async_session_store.lookup_by_session_key(expected_key)
+            if current_entry is None or not pinned_id or current_entry.session_id != pinned_id:
+                self._reject_strict_session_event(gateway_event, "strict_session_identity_mismatch")
+                return rejected("strict_session_rejected")
+            # A Stop may have closed the durable gate while identity lookup yielded.
+            if callable(allowed) and not await allowed(gateway_event):
+                gateway_event._gateway_rejection_reason = f"{veto_kind}_veto"
+                return rejected(f"{veto_kind}_rejected")
+        # Even the policy hook may yield. Never admit a replaced generation after it.
+        if not self._run_still_current_fn(session_key, run_generation)():
+            return rejected("stale_run_generation")
         return None
 
     def _run_agent_display_settings(self, source: SessionSource) -> "GatewayRunner._RunAgentDisplay":
@@ -3958,7 +3962,7 @@ class GatewayTurnMixin:
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
-                event_message_id=event_message_id,
+                event_message_id=event_message_id, gateway_event=gateway_event,
             )
 
         from run_agent import AIAgent
