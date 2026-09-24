@@ -768,7 +768,7 @@ def _approval_send_outcome(future, timeout: float) -> str:
     return "failed"
 
 
-def _clarify_send_disposition(fut, *, session_key: str, clarify_mod) -> "str | None":
+def _clarify_send_disposition(fut, *, clarify_id: str, clarify_mod) -> "str | None":
     """Decide whether a clarify prompt send aborts the wait; returns the abort sentinel or ``None``.
 
     Only a DEFINITIVE failure tears down the registration; ``ambiguous`` (card may have posted) stays armed
@@ -784,12 +784,12 @@ def _clarify_send_disposition(fut, *, session_key: str, clarify_mod) -> "str | N
             "Clarify prompt DECLINED by the connector's egress guard; "
             "clearing registration"
         )
-        clarify_mod.clear_session(session_key)
+        clarify_mod.cancel(clarify_id)
         return "[clarify prompt could not be delivered: destination refused]"
     if outcome == "failed":
         # Undeliverable: clear the registration and return the sentinel so the agent falls back, not hangs.
         logger.warning("Clarify send failed definitively; clearing registration")
-        clarify_mod.clear_session(session_key)
+        clarify_mod.cancel(clarify_id)
         return "[clarify prompt could not be delivered]"
     if outcome == "ambiguous":
         logger.warning(
@@ -798,9 +798,9 @@ def _clarify_send_disposition(fut, *, session_key: str, clarify_mod) -> "str | N
     return None
 
 
-def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_mod) -> str:
+def _clarify_send_then_wait(fut, *, clarify_id: str, clarify_mod) -> str:
     """Resolve a clarify prompt: send disposition, then the bounded wait."""
-    abort = _clarify_send_disposition(fut, session_key=session_key, clarify_mod=clarify_mod)
+    abort = _clarify_send_disposition(fut, clarify_id=clarify_id, clarify_mod=clarify_mod)
     if abort is not None:
         return abort
     timeout = clarify_mod.get_clarify_timeout()

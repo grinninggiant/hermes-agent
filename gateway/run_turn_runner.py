@@ -51,6 +51,10 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        # Registration ownership is per runner, including legacy callbacks without turn_owner.
+        self._clarify_lock = threading.Lock()
+        self._clarify_ids: set[str] = set()
+        self._clarify_closed = False
 
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -1272,7 +1276,8 @@ class TurnRunner:
             logger.warning("%s boundary timed out or failed: %s", reason, err)
             return False
 
-    def _clarify_callback_sync(self, question: str, choices, multi_select: bool = False) -> str:
+    def _clarify_callback_sync(self, question: str, choices, multi_select: bool = False, *,
+                               turn_owner: tuple[str, str] | None = None) -> str:
         """Present a clarify prompt and block on a response (clarify_tool's synchronous contract):
         schedule send_clarify on the gateway loop, block on the primitive's threading.Event with a
         timeout. Returns the response string, or a sentinel when none arrived."""
@@ -1285,10 +1290,14 @@ class TurnRunner:
         session_key = ctx.session_key or ""
         clarify_id = uuid.uuid4().hex[:10]
         choices = list(choices) if choices else None
-        clarify_mod.register(
-            clarify_id=clarify_id, session_key=session_key, question=question, choices=choices,
-            multi_select=bool(multi_select),
-        )
+        with self._clarify_lock:
+            if self._clarify_closed:
+                return "[clarify cancelled: turn finished]"
+            clarify_mod.register(
+                clarify_id=clarify_id, session_key=session_key, question=question, choices=choices,
+                multi_select=bool(multi_select), turn_owner=turn_owner,
+            )
+            self._clarify_ids.add(clarify_id)
         # Unlike approval, clarify passes reopen=True so the continuation re-opens a native stream
         # below the question; if the re-seed fails the consumer degrades to send() automatically.
         self._close_native_stream_boundary("Clarify", "💬 等待你的选择...", reopen=True)
@@ -1315,7 +1324,7 @@ class TurnRunner:
         # Boundary rule (see _approval_send_outcome): a send timeout is AMBIGUOUS — the card may
         # have posted with a late ack. Only a definitive failure tears down the registration;
         # ambiguous falls through to the bounded wait so a late reply resolves.
-        response = _clarify_send_then_wait(fut, clarify_id=clarify_id, session_key=session_key, clarify_mod=clarify_mod)
+        response = _clarify_send_then_wait(fut, clarify_id=clarify_id, clarify_mod=clarify_mod)
         # Only re-arm typing when the user actually answered — the undeliverable sentinel and the
         # timeout/cancellation strings start with '[' and must pass through untouched.
         if not (isinstance(response, str) and response.startswith("[")):
@@ -1664,11 +1673,15 @@ class TurnRunner:
             return agent.run_conversation(api_message, **kwargs)
         finally:
             unregister_gateway_notify(session_key)
-            # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
-            # run (interrupt, completion, gateway shutdown). Idempotent.
+            # Never sweep the session: a successor may already be waiting on its own prompt.
+            # Close registration under the same lock so a late callback cannot outlive this run.
             with suppress(Exception):
-                from tools.clarify_gateway import clear_session
-                clear_session(session_key)
+                from tools.clarify_gateway import cancel
+                with self._clarify_lock:
+                    self._clarify_closed = True
+                    for clarify_id in self._clarify_ids:
+                        cancel(clarify_id)
+                    self._clarify_ids.clear()
             reset_current_session_key(token)
 
     def _finish_stream_consumer(self, result, agent_history, stream_consumer):
