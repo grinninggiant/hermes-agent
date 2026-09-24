@@ -42,9 +42,8 @@ def _make_runner():
     runner._running_agents = {}
     runner._pending_messages = {}
 
-    # _invalidate_session_run_generation + _release_running_agent_state are
-    # called downstream; stub to no-op so we exercise the hook emit only.
-    runner._invalidate_session_run_generation = lambda *a, **kw: None
+    # Keep the real generation fence; only persistence/release side effects are irrelevant here.
+    runner._persist_active_agents = lambda: None
     runner._release_running_agent_state = lambda *a, **kw: None
     return runner
 

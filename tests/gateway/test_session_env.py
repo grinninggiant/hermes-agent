@@ -78,20 +78,33 @@ def test_set_session_env_sets_contextvars(monkeypatch):
 
 
 def test_unrouted_session_binds_actual_serving_profile(tmp_path, monkeypatch):
-    home = tmp_path / ".hermes" / "profiles" / "general"
-    home.mkdir(parents=True)
+    from agent.secret_scope import set_multiplex_active
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    homes = [tmp_path / ".hermes" / "profiles" / name for name in ("general", "other")]
+    for home in homes:
+        home.mkdir(parents=True)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(homes[0]))
     runner = object.__new__(GatewayRunner)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="session")
     context = SessionContext(source=source, connected_platforms=[], home_channels={})
 
-    tokens = runner._set_session_env(context)
+    set_multiplex_active(True)
     try:
-        assert source.profile is None  # No configured cross-profile route.
-        assert get_session_env("HERMES_SESSION_PROFILE") == "general"
+        for home in (homes[0], homes[1], homes[0]):
+            home_token = set_hermes_home_override(home)
+            try:
+                tokens = runner._set_session_env(context)
+                try:
+                    assert source.profile is None  # No configured cross-profile route.
+                    assert get_session_env("HERMES_SESSION_PROFILE") == home.name
+                finally:
+                    runner._clear_session_env(tokens)
+            finally:
+                reset_hermes_home_override(home_token)
     finally:
-        runner._clear_session_env(tokens)
+        set_multiplex_active(False)
 
 
 def test_clear_session_env_restores_previous_state(monkeypatch):
