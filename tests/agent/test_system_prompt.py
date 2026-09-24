@@ -589,6 +589,8 @@ class TestTelegramRichMessagesHint:
         stable = _stable_prompt(agent)
         assert "lean into it" in stable
         assert "task lists" in stable
+        # The effective rich renderer must not simultaneously forbid its tables.
+        assert "no tables" not in stable.casefold()
 
     def test_malformed_extra_value_falls_back_to_base_hint(self, tmp_path, monkeypatch):
         """A truthy non-mapping ``extra`` must not crash prompt construction —

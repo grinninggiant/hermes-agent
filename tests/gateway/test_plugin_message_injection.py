@@ -147,6 +147,91 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["human_cancel", "permission_revoked"])
+async def test_public_guard_is_preserved_until_actual_ingress(tmp_path, monkeypatch, reason):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(yaml.safe_dump({
+        "plugins": {"entries": {"notify-plugin": {"allow_gateway_injection": True}}}
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    entry = _entry()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(entry, adapter)
+    runner._gateway_loop = asyncio.get_running_loop()
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager)
+    manager.set_gateway_message_injector(runner, runner._schedule_plugin_message_injection)
+    state = {"allowed": True}
+    assert context.inject_message("old work", session_key=entry.session_key,
+        expected_session_id=entry.session_id, dispatch_guard=lambda: state["allowed"]) is True
+    await next(iter(runner._background_tasks))
+    message = adapter.handle_message.await_args.args[0]
+    assert message.metadata["hermes_plugin_guard_required"] is True
+    assert await runner._hm_admit_event(message) is not None
+    if reason == "human_cancel":
+        state["allowed"] = False
+    else:
+        (home / "config.yaml").write_text(yaml.safe_dump({
+            "plugins": {"entries": {"notify-plugin": {"allow_gateway_injection": False}}}
+        }))
+    assert await runner._hm_admit_event(message) is None
+
+
+@pytest.mark.asyncio
+async def test_public_injection_cannot_follow_session_replacement(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(yaml.safe_dump({
+        "plugins": {"entries": {"notify-plugin": {"allow_gateway_injection": True}}}
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    entry = _entry()
+    adapter = _RoutingAdapter()
+    adapter.set_message_handler(AsyncMock())
+    runner = _runner(entry, adapter)
+    runner._gateway_loop = asyncio.get_running_loop()
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager)
+    manager.set_gateway_message_injector(runner, runner._schedule_plugin_message_injection)
+    assert context.inject_message("old work", session_key=entry.session_key,
+                                  expected_session_id=entry.session_id) is True
+    # Scheduling acknowledgement preceded actual lookup; a human reset wins.
+    entry.session_id = "replacement-session"
+    tasks = tuple(runner._background_tasks)
+    assert len(tasks) == 1
+    assert await tasks[0] is False
+    adapter._message_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected", ["retired-session", "", 42])
+async def test_dispatch_rejects_wrong_or_invalid_original_session(expected):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    entry = _entry()
+    runner = _runner(entry, adapter)
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="resume authorized work",
+        plugin_id="notify-plugin", expected_session_id=expected,
+    )
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_accepts_exact_original_session():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    entry = _entry()
+    runner = _runner(entry, adapter)
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="resume authorized work",
+        plugin_id="notify-plugin", expected_session_id=entry.session_id,
+    )
+    assert accepted is True
+    assert adapter.handle_message.await_args.args[0].metadata["gateway_session_id"] == entry.session_id
+
+
+@pytest.mark.asyncio
 async def test_dispatch_uses_stored_origin_and_adapter_message_path():
     adapter = SimpleNamespace(handle_message=AsyncMock())
     entry = _entry()

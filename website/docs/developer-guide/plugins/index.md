@@ -1868,6 +1868,31 @@ services.hermes-agent.extraPlugins = [
 
 See the [Nix Setup guide](../../getting-started/nix-setup.md#plugins) for complete documentation including overlay usage and collision checking.
 
+## Guarded gateway continuation
+
+`ctx.inject_message(content, session_key=key, expected_session_id=original_id,
+dispatch_guard=still_authorized)` can bind deferred work to its original gateway
+session. The existing `allow_gateway_injection: true` permission remains required
+and is read from the plugin manager's owning profile, not an ambient profile.
+
+- `expected_session_id` is optional for existing callers, but mandatory with a
+  dispatch guard. Empty/invalid bindings and guarded CLI injection are refused.
+- The guard must be a fast, synchronous, read-only callable returning literal
+  `True`. It can run repeatedly when queued work reaches gateway ingress. Use it
+  to inspect a persistent, operation-specific cancellation/freshness fence;
+  do not perform external effects or claim delivery from the predicate.
+- Current plugin consent is rechecked with the guard. False, exceptions or a
+  missing guard drop the work. A restored event retains its required-guard
+  marker but not the Python callable: its owner must reconstruct a fresh guarded
+  request rather than replay it unguarded.
+- Existing internal-event identity checks, gateway authorization and
+  `allow_gateway_control=False` remain intact. A replacement session does not
+  inherit an old request.
+- A `True` injection result still acknowledges asynchronous scheduling only.
+  This API does **not** provide a durable intent store, completion receipt,
+  restart recovery or exactly-once external effects. The producer owns those
+  contracts and must verify actual turn and delivery outcomes separately.
+
 ## Common mistakes
 
 **Handler doesn't return JSON string:**

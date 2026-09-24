@@ -229,6 +229,8 @@ def test_credential_fill_uses_stored_helper_and_never_prompts(tmp_path, monkeypa
     gitconfig.write_text(f'[credential "https://git.example.test"]\n\thelper = !{helper}\n', encoding="utf-8")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
     monkeypatch.setenv("GIT_ASKPASS", "/nonexistent/askpass-must-not-run")
+    # The fixture owns its helper; never consult the developer checkout's local credentials.
+    monkeypatch.chdir(tmp_path)
 
     assert git_credentials.resolve_git_basic_auth("https://git.example.test/acme/x.git") == ("bob", "pw-from-helper")
     # Unknown host: no helper answers → None quickly, no prompt attempt escaped.

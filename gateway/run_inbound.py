@@ -218,6 +218,14 @@ class GatewayInboundMixin:
             return None
 
         if is_internal:
+            if (event.metadata or {}).get("hermes_plugin_guard_required") is True:
+                guard = getattr(event, "_hermes_plugin_dispatch_guard", None)
+                try:
+                    if not callable(guard) or guard() is not True:
+                        return None
+                except Exception:
+                    logger.warning("Plugin dispatch guard unavailable; dropping internal work")
+                    return None
             return event, source, True
 
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
@@ -1809,7 +1817,9 @@ class GatewayInboundMixin:
         get_plugin_manager().clear_gateway_message_injector(self)
 
     def _schedule_plugin_message_injection(
-        self, *, session_key: str, content: str, plugin_id: str
+        self, *, session_key: str, content: str, plugin_id: str,
+        expected_session_id: str | None = None,
+        dispatch_guard: Any = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe)."""
         from gateway.run import safe_schedule_threadsafe
@@ -1819,6 +1829,8 @@ class GatewayInboundMixin:
 
         coro = self._dispatch_plugin_message_injection(
             session_key=session_key, content=content, plugin_id=plugin_id,
+            **({"expected_session_id": expected_session_id} if expected_session_id is not None else {}),
+            **({"dispatch_guard": dispatch_guard} if dispatch_guard is not None else {}),
         )
         try:
             current_loop = asyncio.get_running_loop()
@@ -1859,7 +1871,9 @@ class GatewayInboundMixin:
         return True
 
     async def _dispatch_plugin_message_injection(
-        self, *, session_key: str, content: str, plugin_id: str
+        self, *, session_key: str, content: str, plugin_id: str,
+        expected_session_id: str | None = None,
+        dispatch_guard: Any = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         def _accepting() -> bool:
@@ -1869,6 +1883,12 @@ class GatewayInboundMixin:
             return False
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if entry is None or entry.origin is None or not _accepting():
+            return False
+
+        if expected_session_id is not None and (
+            not isinstance(expected_session_id, str) or not expected_session_id
+            or entry.session_id != expected_session_id
+        ):
             return False
 
         from gateway.session_identity import replace_source
@@ -1892,7 +1912,7 @@ class GatewayInboundMixin:
         if adapter is None:
             return False
 
-        await adapter.handle_message(MessageEvent(
+        event = MessageEvent(
             text=content, message_type=MessageType.TEXT, source=source, internal=True,
             allow_gateway_control=False,
             metadata={
@@ -1900,7 +1920,11 @@ class GatewayInboundMixin:
                 "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
                 "gateway_session_strict": True,
             },
-        ))
+        )
+        if dispatch_guard is not None:
+            event.metadata["hermes_plugin_guard_required"] = True
+            setattr(event, "_hermes_plugin_dispatch_guard", dispatch_guard)
+        await adapter.handle_message(event)
         logger.info(
             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
             plugin_id, session_key, entry.session_id,

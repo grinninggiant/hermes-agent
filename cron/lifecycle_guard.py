@@ -409,6 +409,10 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     """
     if not text:
         return False
+    from cron.lifecycle_service_identity import verified_external_launchctl_target
+
+    if verified_external_launchctl_target(text):
+        return False
     # Provably inert heredoc bodies (quoted delimiter, data-sink consumer like `cat > f <<'EOF'`)
     # are documentation, not commands. The stripper fails open on ANY ambiguity (unquoted delimiter,
     # shell consumer, unterminated body), so executable heredocs are still scanned.

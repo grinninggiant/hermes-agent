@@ -602,14 +602,28 @@ class PluginContext:
     # manager's home, never the active profile's (#65593 constraint).
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
+        expected_session_id: str | None = None,
+        dispatch_guard: Callable[[], bool] | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation (new turn if idle, interrupt if running).
         Gateway injection needs an existing ``session_key`` plus
         ``plugins.entries.<plugin_id>.allow_gateway_injection``; ``True`` means the gateway accepted the
-        request for async dispatch, not that delivery completed."""
+        request for async dispatch, not that delivery completed. Optional
+        ``expected_session_id`` binds gateway dispatch to the original session;
+        a replaced session is refused rather than inheriting old work."""
+        if expected_session_id is not None and (
+            not isinstance(expected_session_id, str) or not expected_session_id
+        ):
+            return False
+        if dispatch_guard is not None:
+            from inspect import iscoroutinefunction
+            if not expected_session_id or not callable(dispatch_guard) or iscoroutinefunction(dispatch_guard):
+                return False
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
         if cli is not None:
+            if expected_session_id is not None:
+                return False  # Gateway session binding is not a CLI routing mechanism.
             queue_ = cli._interrupt_queue if getattr(cli, "_agent_running", False) else cli._pending_input
             queue_.put(msg)
             return True
@@ -624,9 +638,24 @@ class PluginContext:
         if not self._manager.has_gateway_message_injector:
             logger.warning("inject_message: no live gateway is available")
             return False
+
+        def current_dispatch_allowed() -> bool:
+            from inspect import iscoroutine
+            with _plugin_home_scope(self._manager.home_path):
+                if dispatch_guard is None or not self._gateway_injection_allowed():
+                    return False
+                result = dispatch_guard()
+                if iscoroutine(result):
+                    result.close()
+                    return False
+                return result is True
+
         try:
             return bool(self._manager.inject_gateway_message(
                 session_key=session_key, content=msg, plugin_id=self.plugin_id,
+                **({"expected_session_id": expected_session_id} if expected_session_id is not None else {}),
+                **({"dispatch_guard": current_dispatch_allowed}
+                   if dispatch_guard is not None else {}),
             ))
         except Exception:
             logger.warning("inject_message: gateway scheduling failed for plugin %s", self.plugin_id,
@@ -634,9 +663,10 @@ class PluginContext:
             return False
 
     def _gateway_injection_allowed(self) -> bool:
-        """Return whether this plugin may trigger gateway session turns."""
+        """Read consent from the immutable owning profile, never the ambient home."""
         try:
-            cfg = load_config_readonly() or {}
+            with _plugin_home_scope(self._manager.home_path):
+                cfg = load_config_readonly() or {}
         except Exception:
             return False
         return (_plugin_settings_entry(cfg, self.plugin_id) or {}).get("allow_gateway_injection") is True
