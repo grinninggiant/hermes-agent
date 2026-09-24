@@ -214,6 +214,7 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         connected_platforms=[],
         home_channels={},
         session_key="agent:main:telegram:dm:2144471399",
+        session_id="resolved-hermes-session",
     )
 
     tokens = runner._set_session_env(context)
@@ -224,6 +225,7 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
                 "chat_id": get_session_env("HERMES_SESSION_CHAT_ID"),
                 "user_id": get_session_env("HERMES_SESSION_USER_ID"),
                 "session_key": get_session_env("HERMES_SESSION_KEY"),
+                "session_id": get_session_env("HERMES_SESSION_ID"),
             }
         )
     finally:
@@ -235,9 +237,68 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         "chat_id": "2144471399",
         "user_id": "123456",
         "session_key": "agent:main:telegram:dm:2144471399",
+        "session_id": "resolved-hermes-session",
     }
 
 
+
+
+@pytest.mark.asyncio
+async def test_resolved_session_id_survives_rebind_without_agent_constructor(monkeypatch):
+    """A cached agent must not need construction to restore tool/hook ownership."""
+    runner = object.__new__(GatewayRunner)
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-other-owner")
+    context = SessionContext(
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="canary"),
+        connected_platforms=[], home_channels={},
+        session_key="route-canary", session_id="resolved-owner",
+    )
+    try:
+        for _ in range(2):
+            tokens = runner._set_session_env(context)
+            try:
+                assert await runner._run_in_executor_with_context(
+                    get_session_env, "HERMES_SESSION_ID"
+                ) == "resolved-owner"
+                assert os.environ["HERMES_SESSION_ID"] == "stale-other-owner"
+            finally:
+                runner._clear_session_env(tokens)
+            assert get_session_env("HERMES_SESSION_ID") == ""
+    finally:
+        runner._shutdown_executor()
+
+
+@pytest.mark.asyncio
+async def test_resolved_session_ids_are_isolated_across_concurrent_turns(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-process-owner")
+    ready = asyncio.Event()
+    entered = []
+
+    async def turn(session_id):
+        context = SessionContext(
+            source=SessionSource(platform=Platform.TELEGRAM, chat_id=session_id or "blank"),
+            connected_platforms=[], home_channels={}, session_id=session_id,
+        )
+        tokens = runner._set_session_env(context)
+        try:
+            entered.append(session_id)
+            if len(entered) == 3:
+                ready.set()
+            await asyncio.wait_for(ready.wait(), timeout=2)
+            return await runner._run_in_executor_with_context(
+                get_session_env, "HERMES_SESSION_ID"
+            )
+        finally:
+            runner._clear_session_env(tokens)
+
+    try:
+        assert await asyncio.gather(turn("owner-A"), turn("owner-B"), turn("")) == [
+            "owner-A", "owner-B", "",
+        ]
+        assert os.environ["HERMES_SESSION_ID"] == "stale-process-owner"
+    finally:
+        runner._shutdown_executor()
 
 
 def test_cron_session_contextvar_preserves_legacy_env_fallback(monkeypatch):
