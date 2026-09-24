@@ -1,5 +1,6 @@
 """Contracts for the public interrupt and recursive internal-turn boundaries."""
 
+import asyncio
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -7,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
@@ -121,3 +123,46 @@ async def test_recursive_internal_turn_is_rejected_for_mismatched_pinned_session
     assert result["interrupted"] is True
     assert event.metadata["gateway_session_rejected"] == "strict_session_identity_mismatch"
     runner._run_agent_inner.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_old_cancel_unwind_preserves_successor_guard_task_and_pending():
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def old_worker():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    old_task = asyncio.create_task(old_worker())
+    await asyncio.sleep(0)
+    old_guard = asyncio.Event()
+    new_guard = asyncio.Event()
+    new_task = asyncio.create_task(asyncio.Event().wait())
+    adapter = SimpleNamespace(
+        name="test", _session_tasks={"k": old_task}, _active_sessions={"k": old_guard},
+        _pending_messages={"k": "old"}, _expected_cancelled_tasks=set(),
+        _discard_text_debounce=lambda _key: None,
+    )
+    adapter._release_session_guard = lambda key, *, guard=None: adapter._active_sessions.pop(key, None)
+    cancel = asyncio.create_task(BasePlatformAdapter.cancel_session_processing(
+        adapter, "k", expected_task=old_task, expected_guard=old_guard,  # type: ignore[arg-type]
+    ))
+    try:
+        await asyncio.wait_for(cancelled.wait(), 1)
+        adapter._session_tasks["k"] = new_task
+        adapter._active_sessions["k"] = new_guard
+        adapter._pending_messages["k"] = "new"
+        release.set()
+        await asyncio.wait_for(cancel, 1)
+        assert adapter._session_tasks["k"] is new_task
+        assert adapter._active_sessions["k"] is new_guard
+        assert adapter._pending_messages["k"] == "new"
+        assert not new_task.cancelled()
+    finally:
+        release.set()
+        new_task.cancel()
+        await asyncio.gather(old_task, new_task, return_exceptions=True)

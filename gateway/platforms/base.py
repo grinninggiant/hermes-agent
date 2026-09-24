@@ -3535,11 +3535,18 @@ class BasePlatformAdapter(ABC):
         return True
 
     async def cancel_session_processing(self, session_key: str, *, release_guard: bool = True,
-                                        discard_pending: bool = True) -> None:
+                                        discard_pending: bool = True,
+                                        expected_task: Optional[asyncio.Task] = None,
+                                        expected_guard: Optional[asyncio.Event] = None) -> None:
         """Cancel in-flight processing for one session. ``release_guard=False`` keeps the guard so
         reset-like commands finish atomically; the await is bounded (5s) so a wedged finally can't
         stall."""
-        task = self._session_tasks.pop(session_key, None)
+        guard = self._active_sessions.get(session_key)
+        task = self._session_tasks.get(session_key)
+        if ((expected_task is not None and task is not expected_task)
+                or (expected_guard is not None and guard is not expected_guard)):
+            return
+        self._session_tasks.pop(session_key, None)
         if task is not None and not task.done():
             logger.debug("[%s] Cancelling active processing for session %s", self.name, session_key)
             self._expected_cancelled_tasks.add(task)
@@ -3555,11 +3562,14 @@ class BasePlatformAdapter(ABC):
             except Exception:
                 logger.debug("[%s] Session cancellation raised while unwinding %s", self.name,
                              session_key, exc_info=True)
+        # A new turn can acquire this key while the cancelled task unwinds.
+        if self._active_sessions.get(session_key) is not guard or self._session_tasks.get(session_key) is not None:
+            return
         if discard_pending:
             self._pending_messages.pop(session_key, None)
             self._discard_text_debounce(session_key)
         if release_guard:
-            self._release_session_guard(session_key)
+            self._release_session_guard(session_key, guard=guard)
 
     async def _drain_pending_after_session_command(
         self, session_key: str, command_guard: asyncio.Event) -> None:
