@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from importlib import import_module
+from functools import partial
 from typing import Any, Callable, Dict, Optional, Tuple
 
 
@@ -93,6 +94,18 @@ class InlineToolContext:
     effective_task_id: str
     tool_call_id: Optional[str] = None
     messages: Optional[list] = None
+    clarify_callback: Optional[Callable] = None
+
+
+def bind_clarify_callback(agent):
+    """Snapshot the callback and native owner before pre-tool hooks can yield."""
+    from tools.clarify_tool import _accepts_kwarg
+
+    callback = getattr(agent, "clarify_callback", None)
+    if callback is not None and _accepts_kwarg(callback, "turn_owner"):
+        owner = (getattr(agent, "session_id", "") or "", getattr(agent, "_current_turn_id", "") or "")
+        return partial(callback, turn_owner=owner)
+    return callback
 
 
 InlineToolExecutor = Callable[[Any, dict, InlineToolContext], Any]
@@ -252,7 +265,7 @@ INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
         "tools.clarify_tool", "clarify_tool",
         ("question", "question", ""), ("choices", "choices"), ("multi_select", "multi_select", False),
         ("questions", "questions"),
-        callback=lambda agent, ctx: agent.clarify_callback,
+        callback=lambda agent, ctx: ctx.clarify_callback,
     ),
     "read_terminal": _callback_tool(
         "tools.read_terminal_tool", "read_terminal_tool", "read_terminal_callback",

@@ -2369,12 +2369,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     no display logic. Used by the concurrent path; the sequential path keeps its own inline
     invocation for display."""
     from agent.inline_tool_executors import (
-        InlineToolContext, apply_transform_tool_result, emit_terminal_post_tool_call,
+        InlineToolContext, apply_transform_tool_result, bind_clarify_callback, emit_terminal_post_tool_call,
         resolve_invoke_tool_executor, tool_hook_ids
     )
     if not isinstance(function_args, dict):
         function_args = {}
     hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
+    clarify_callback = bind_clarify_callback(agent) if function_name == "clarify" else None
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
@@ -2402,7 +2403,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     inline_executor = resolve_invoke_tool_executor(agent, function_name)
     if inline_executor is not None:
         inline_ctx = InlineToolContext(
-            effective_task_id=effective_task_id, tool_call_id=tool_call_id, messages=messages
+            effective_task_id=effective_task_id, tool_call_id=tool_call_id, messages=messages,
+            clarify_callback=clarify_callback,
         )
 
         def _execute(next_args: dict) -> Any:

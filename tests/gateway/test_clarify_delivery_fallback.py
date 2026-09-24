@@ -68,7 +68,7 @@ def loop():
 def _runner(adapter, loop, monkeypatch, timeout=5):
     from gateway.run_turn_runner import TurnRunner
 
-    runner = object.__new__(TurnRunner)
+    runner = TurnRunner(None, None)
     runner._ctx = SimpleNamespace(
         _status_adapter=adapter, _status_chat_id="42", _status_thread_metadata=None,
         session_key="sk-fallback", stream_consumer_holder=[None], _loop_for_step=loop)

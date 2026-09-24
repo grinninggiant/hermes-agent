@@ -35,6 +35,7 @@ from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
     InlineToolContext,
     apply_transform_tool_result,
+    bind_clarify_callback,
     emit_terminal_post_tool_call,
     tool_hook_ids,
 )
@@ -1618,7 +1619,10 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     if function_name != "delegate_task" and function_name in INLINE_TOOL_EXECUTORS:
         # Agent-level tools that need live AIAgent state; table shared with invoke_tool.
         inline_executor = INLINE_TOOL_EXECUTORS[function_name]
-        inline_ctx = InlineToolContext(effective_task_id=effective_task_id, tool_call_id=tool_call_id, messages=messages)
+        inline_ctx = InlineToolContext(
+            effective_task_id=effective_task_id, tool_call_id=tool_call_id, messages=messages,
+            clarify_callback=bind_clarify_callback(agent) if function_name == "clarify" else None,
+        )
         return _SequentialDispatch(lambda next_args: inline_executor(agent, next_args, inline_ctx), finish_in_finally=False)
     if function_name == "delegate_task":
         spinner = _start_quiet_tool_spinner(agent, function_name, function_args, label=_delegate_spinner_label(function_args))

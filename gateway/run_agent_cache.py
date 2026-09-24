@@ -482,10 +482,14 @@ class GatewayAgentCacheMixin:
     async def _interrupt_and_clear_session(
         self, session_key: str, source: SessionSource, *, interrupt_reason: str,
         invalidation_reason: str, release_running_state: bool = True,
-    ) -> None:
+        expected_run_generation: Optional[int] = None,
+    ) -> bool:
         """Interrupt the current run and clear queued session state consistently."""
-        if not session_key:
-            return
+        if not session_key or (
+            expected_run_generation is not None
+            and not self._is_session_run_current(session_key, expected_run_generation)
+        ):
+            return False
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
         _generation_at_interrupt = self._interrupt_running_turn(
@@ -524,6 +528,9 @@ class GatewayAgentCacheMixin:
                 await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
+        # Transport cleanup can yield long enough for a successor to claim this key.
+        if not self._is_session_run_current(session_key, _generation_at_interrupt):
+            return True
         if adapter and hasattr(adapter, "get_pending_message"):
             # Discard a stale human follow-up (the slot held only user text when /stop started doing
             # this, 59575d6a917) — but an internal wake (async-delegation completion, notify+wake)
@@ -548,31 +555,38 @@ class GatewayAgentCacheMixin:
             # Guarded release: a message that arrived during the awaits above may already run as
             # the successor generation — the displaced /stop tail must not wipe its slot.
             self._drop_turn_slot(session_key, run_generation=_generation_at_interrupt)
+        return True
 
     async def interrupt_session_processing(
         self, source: SessionSource, *, reason: str = "platform_stop",
         expected_session_id: Optional[str] = None,
+        expected_run_generation: Optional[int] = None,
     ) -> bool:
-        """Interrupt the session currently routed from ``source``.
+        """Interrupt only the requested generation (or the one current at entry).
 
         This is the public, source-scoped seam for platform integrations.  It deliberately
         delegates to the native interrupt funnel so hard interruption, generation invalidation,
         process cleanup, pending-message cleanup, and cache eviction remain one operation.
+        A durable Stop receipt should pass its captured ``expected_run_generation``;
+        ``expected_session_id`` alone cannot identify successive turns of a conversation.
         """
         session_key = self._session_key_for_source(source)
         if not session_key:
             return False
+        if expected_run_generation is None:
+            state = self._peek_session_state(session_key)
+            expected_run_generation = state.persistent.run_generation if state is not None else 0
         if expected_session_id is not None:
             entry = await self.async_session_store.lookup_by_session_key(session_key)
             if entry is None or entry.session_id != expected_session_id:
                 return False
-        await self._interrupt_and_clear_session(
+        return await self._interrupt_and_clear_session(
             session_key,
             source,
             interrupt_reason=reason,
             invalidation_reason=reason,
+            expected_run_generation=expected_run_generation,
         )
-        return True
 
     async def _refresh_agent_cache_message_count(self, session_key: str, session_id: Optional[str]) -> None:
         """Re-baseline a cached agent's stored message_count after THIS turn — the coherence guard

@@ -222,6 +222,7 @@ class TestRunAgentProxyDispatch:
         }
 
         runner._run_agent_via_proxy = AsyncMock(return_value=expected_result)
+        generation = runner._begin_session_run_generation("test-key")
 
         result = await runner._run_agent(
             message="hi",
@@ -230,12 +231,12 @@ class TestRunAgentProxyDispatch:
             source=source,
             session_id="test-session-123",
             session_key="test-key",
-            run_generation=7,
+            run_generation=generation,
         )
 
         assert result["final_response"] == "Hello from remote!"
         runner._run_agent_via_proxy.assert_called_once()
-        assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
+        assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == generation
 
 
 class TestRunAgentViaProxy:

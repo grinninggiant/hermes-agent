@@ -27,6 +27,7 @@ class _ClarifyEntry:
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
+    turn_owner: Optional[tuple[str, str]] = None  # native (session_id, turn_id), never model args
 
 
 _lock = threading.RLock()
@@ -44,11 +45,12 @@ TEXT_NO_PENDING = "no_pending"
 
 
 def register(clarify_id: str, session_key: str, question: str, choices: Optional[List[str]],
-             multi_select: bool = False) -> _ClarifyEntry:
+             multi_select: bool = False, *, turn_owner: Optional[tuple[str, str]] = None) -> _ClarifyEntry:
     """Register a pending clarify request; caller then blocks on ``wait_for_response``.
     Open-ended (no choices) entries start in text mode: the next message IS the response."""
     entry = _ClarifyEntry(clarify_id, session_key, question, list(choices) if choices else None,
-                          bool(multi_select) and bool(choices), awaiting_text=not bool(choices))
+                          bool(multi_select) and bool(choices), awaiting_text=not bool(choices),
+                          turn_owner=turn_owner)
     with _lock:
         _entries[clarify_id] = entry
         _session_index.setdefault(session_key, []).append(clarify_id)
@@ -235,6 +237,24 @@ def has_pending(session_key: str) -> bool:
     """True when this session has at least one pending clarify entry."""
     with _lock:
         return any(_entries.get(cid) is not None for cid in _session_index.get(session_key) or [])
+
+
+def cancel(clarify_id: str) -> bool:
+    """Remove one registration, waking its waiter without overwriting an accepted reply."""
+    with _lock:
+        entry = _entries.pop(clarify_id, None)
+        if entry is None:
+            return False
+        ids = _session_index.get(entry.session_key) or []
+        if clarify_id in ids:
+            ids.remove(clarify_id)
+            if not ids:
+                _session_index.pop(entry.session_key, None)
+        if entry.event.is_set():
+            return False
+        entry.response = ""
+        entry.event.set()
+        return True
 
 
 def clear_session(session_key: str) -> int:

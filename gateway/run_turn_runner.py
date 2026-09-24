@@ -78,6 +78,10 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        # Registration ownership is per runner, including legacy callbacks without turn_owner.
+        self._clarify_lock = threading.Lock()
+        self._clarify_ids: set[str] = set()
+        self._clarify_closed = False
 
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -1381,7 +1385,7 @@ class TurnRunner:
             return False
 
     def _clarify_callback_sync(self, question: str, choices, multi_select: bool = False,
-                               questions=None) -> str:
+                               questions=None, *, turn_owner: tuple[str, str] | None = None) -> str:
         """Present a clarify prompt and block on a response (clarify_tool's synchronous contract):
         schedule send_clarify on the gateway loop, block on the primitive's threading.Event with a
         timeout. Returns the response string, or a sentinel when none arrived.
@@ -1392,11 +1396,11 @@ class TurnRunner:
         and treated that text as the question's answer.
         """
         if questions:
-            return self._clarify_batch_sync(questions)
-        response, _answered = self._ask_clarify_question(question, choices, multi_select)
+            return self._clarify_batch_sync(questions, turn_owner=turn_owner)
+        response, _answered = self._ask_clarify_question(question, choices, multi_select, turn_owner=turn_owner)
         return response
 
-    def _clarify_batch_sync(self, questions) -> str:
+    def _clarify_batch_sync(self, questions, *, turn_owner=None) -> str:
         """Answer a batch: one card per question, stop at the first the user never answers.
         Returns the JSON shape clarify_tool's batch path reads. The stream/typing re-arm waits for
         the last question — between two cards it only opens a bubble the next boundary closes."""
@@ -1406,7 +1410,7 @@ class TurnRunner:
         for index, entry in enumerate(questions):
             raw, answered = self._ask_clarify_question(
                 entry.get("question", ""), entry.get("choices"), bool(entry.get("multi_select")),
-                rearm=index == last)
+                rearm=index == last, turn_owner=turn_owner)
             if not answered:
                 # The surface's own no-answer text ("could not be delivered", "did not respond
                 # within Nm") rides along as ``notice``: blank answers alone read as user
@@ -1416,7 +1420,8 @@ class TurnRunner:
             answers[entry.get("qid") or f"q{index}"] = raw
         return json.dumps(payload, ensure_ascii=False)
 
-    def _ask_clarify_question(self, question, choices, multi_select, rearm: bool = True) -> tuple[str, bool]:
+    def _ask_clarify_question(self, question, choices, multi_select, rearm: bool = True,
+                             *, turn_owner=None) -> tuple[str, bool]:
         """One card: register, send, wait, then retire it (no answer) or re-arm (answer).
         Returns ``(response, answered)``; the caller decides what "no answer" means — a sentinel
         for a single question, the batch's ``timed_out`` flag."""
@@ -1441,10 +1446,14 @@ class TurnRunner:
             """Schedule the plain-text prompt when the native card cannot render; None = no such path."""
             coro = text_fallback_coro(ctx._status_adapter, **send_kwargs)
             return None if coro is None else self._schedule(coro, "Clarify text fallback failed to schedule")
-        clarify_mod.register(
-            clarify_id=clarify_id, session_key=session_key, question=question, choices=choices,
-            multi_select=bool(multi_select),
-        )
+        with self._clarify_lock:
+            if self._clarify_closed:
+                return "[clarify cancelled: turn finished]", False
+            clarify_mod.register(
+                clarify_id=clarify_id, session_key=session_key, question=question, choices=choices,
+                multi_select=bool(multi_select), turn_owner=turn_owner,
+            )
+            self._clarify_ids.add(clarify_id)
         # Unlike approval, clarify passes reopen=True so the continuation re-opens a native stream
         # below the question; if the re-seed fails the consumer degrades to send() automatically.
         self._close_native_stream_boundary("Clarify", "💬 等待你的选择...", reopen=True)
@@ -1470,7 +1479,7 @@ class TurnRunner:
         # ambiguous falls through to the bounded wait so a late reply resolves. A definitive
         # failure — immediate or late — retries once as plain text before giving up.
         response, answered = _clarify_send_then_wait(
-            fut, clarify_id=clarify_id, session_key=session_key, clarify_mod=clarify_mod,
+            fut, clarify_id=clarify_id, clarify_mod=clarify_mod,
             fallback=_text_fallback)
         # Branch on the explicit flag, never on the text: a real answer can start with '[' (a
         # "[A] staging" label, "[urgent] ..." free text) and must not be mistaken for a sentinel.
@@ -1854,11 +1863,15 @@ class TurnRunner:
                 return agent.run_conversation(api_message, **kwargs)
         finally:
             unregister_gateway_notify(session_key)
-            # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
-            # run (interrupt, completion, gateway shutdown). Idempotent.
+            # Never sweep the session: a successor may already be waiting on its own prompt.
+            # Close registration under the same lock so a late callback cannot outlive this run.
             with suppress(Exception):
-                from tools.clarify_gateway import clear_session
-                clear_session(session_key)
+                from tools.clarify_gateway import cancel
+                with self._clarify_lock:
+                    self._clarify_closed = True
+                    for clarify_id in self._clarify_ids:
+                        cancel(clarify_id)
+                    self._clarify_ids.clear()
             reset_current_session_key(token)
 
     def _finish_stream_consumer(self, result, agent_history, stream_consumer):
