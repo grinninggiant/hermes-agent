@@ -107,6 +107,78 @@ def test_multiplex_ticker_profile_gate_skips_rejected_profile(tmp_path):
     assert (orphan / "cron" / "ticker_last_success").exists()
 
 
+@pytest.mark.parametrize("named", [False, True])
+def test_startup_gate_precedes_ownership_recovery_and_heartbeat(tmp_path, monkeypatch, named):
+    from cron import scheduler_ownership as ownership
+    from cron.scheduler_provider import InProcessCronScheduler
+    from hermes_constants import get_hermes_home
+
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home in homes:
+        home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = InProcessCronScheduler()
+    recover = provider.recover_interrupted
+    register = ownership.register_ticked_homes
+    recovered, published = [], []
+
+    def recover_owned():
+        home = get_hermes_home()
+        assert ownership.serves_profile(home)
+        recovered.append(home)
+        return recover()
+
+    def publish(owned):
+        published.append(list(owned))
+        register(owned)
+
+    monkeypatch.setattr(provider, "recover_interrupted", recover_owned)
+    monkeypatch.setattr(ownership, "register_ticked_homes", publish)
+    entries = [(home.name, home) for home in homes] if named else homes
+    stop = threading.Event()
+    stop.set()  # Exercise public startup only, before the first cycle can hide an ungated claim.
+    try:
+        for active in [homes[0], homes[1], homes[0]]:
+            rejected = next(home for home in homes if home != active)
+            before = {p: p.read_bytes() for p in rejected.rglob("*") if p.is_file()}
+            recovered.clear()
+            published.clear()
+            provider.start(stop, profile_homes=lambda: entries,
+                           profile_gate=lambda name, home: home == active)
+            assert published == [[active]]
+            assert recovered == [active]
+            assert set(ownership.ticked_homes().values()) == {active}
+            assert (active / "cron" / "ticker_heartbeat").exists()
+            assert {p: p.read_bytes() for p in rejected.rglob("*") if p.is_file()} == before
+    finally:
+        register([])
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, SystemExit])
+def test_startup_gate_error_publishes_no_partial_ownership(tmp_path, monkeypatch, error_type):
+    from cron import scheduler_ownership as ownership
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home in homes:
+        home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    def gate(name, home):
+        if home == homes[1]:
+            raise error_type("startup gate failed")
+        return True
+
+    stop = threading.Event()
+    stop.set()
+    try:
+        InProcessCronScheduler().start(stop, profile_homes=homes, profile_gate=gate)
+        assert ownership.ticked_homes() == {}
+        assert all(not (home / "cron").exists() for home in homes)
+    finally:
+        ownership.register_ticked_homes([])
+
+
 @pytest.mark.parametrize("profile_count", [1, 2])
 def test_desktop_ticker_gates_on_profile_gateway_running(tmp_path, monkeypatch, profile_count):
     """Desktop yields to each live gateway, including a single-profile install."""

@@ -513,8 +513,8 @@ class InProcessCronScheduler(CronScheduler):
         can_dispatch=None, profile_adapters=None, default_profile=None, profile_gate=None,
     ):
         """Tick every profile's store, each scoped via ``_profile_cron_scope``. ``profile_gate(name,
-        home)``, when given, is consulted every cycle; a rejected profile is neither ticked nor
-        heartbeated."""
+        home)``, when given, is consulted at startup and every cycle; a rejected profile is
+        neither owned, recovered, ticked nor heartbeated."""
         from cron.scheduler import tick as cron_tick
         from cron.scheduler import CronTickYielded, _is_fd_exhaustion
         from cron.scheduler_preflight import (
@@ -523,7 +523,15 @@ class InProcessCronScheduler(CronScheduler):
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
         from cron.scheduler_ownership import register_ticked_homes
 
-        initial_homes = _existing_profile_homes(profile_homes)
+        # Gate the entire startup snapshot before claiming ownership or touching any store.
+        initial_homes = []
+        try:
+            initial_homes = [
+                entry for entry in _existing_profile_homes(profile_homes)
+                if profile_gate is None or profile_gate(*_profile_entry(entry))
+            ]
+        except BaseException as e:
+            logger.error("Cron startup profile enumeration error: %s", e, exc_info=True)
         register_ticked_homes([_profile_entry(entry)[1] for entry in initial_homes])
         logger.info(
             "Multiplex cron scheduler started for %d profile(s): %s%s",

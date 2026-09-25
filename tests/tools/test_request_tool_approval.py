@@ -231,19 +231,43 @@ class TestRequestToolApproval:
         res = request_tool_approval("terminal", "curl PUT", rule_key="ext")
         assert res == {"approved": True, "message": None}
 
-    def test_approvals_mode_off_bypasses_gate(self, monkeypatch):
-        """``approvals.mode: off`` (the Desktop "Approvals: off" toggle) must bypass the shared gate
-        exactly like the shell guards do — otherwise computer_use / plugin-rule / SSH-config-write
-        approvals keep prompting a user who turned approvals off."""
-        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "off")
-        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
-        monkeypatch.setattr(
-            approval, "prompt_dangerous_approval",
-            lambda *a, **k: pytest.fail("approvals.mode=off must not prompt"),
-        )
-        monkeypatch.setattr(
-            approval_prompt, "prompt_dangerous_approval",
-            lambda *a, **k: pytest.fail("approvals.mode=off must not prompt"),
-        )
-        res = request_tool_approval("computer_use", "click", rule_key="cua")
-        assert res == {"approved": True, "message": None}
+    @pytest.mark.parametrize("human_present", [False, True])
+    def test_mode_off_keeps_plugin_approval_fail_closed(self, monkeypatch, tmp_path, human_present):
+        """Fork compatibility: shell approval mode must not silence a plugin escalation."""
+        import json
+        import hermes_cli.plugins as plugins
+        import model_tools
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text('approvals:\n  mode: "off"\n')
+        assert approval_context._get_approval_mode() == "off"
+        for name in ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK",
+                     "HERMES_CRON_SESSION", "HERMES_SINGLE_QUERY", "HERMES_SESSION_PLATFORM"):
+            monkeypatch.delenv(name, raising=False)
+        prompts = []
+        if human_present:
+            monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+        def deny(command, description, **kwargs):
+            prompts.append((command, description))
+            return "deny"
+
+        monkeypatch.setattr("tools.terminal_tool._get_approval_callback", lambda: deny if human_present else None)
+        hooks, dispatched = [], []
+
+        def require_approval(**kwargs):
+            hooks.append(kwargs["tool_name"])
+            return {"action": "approve", "message": "fixture requires confirmation", "rule_key": "fixture"}
+
+        manager = plugins.PluginManager()
+        manager._hooks["pre_tool_call"] = [require_approval]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        monkeypatch.setattr(model_tools.registry, "dispatch",
+                            lambda *a, **kw: dispatched.append(a) or json.dumps({"ok": True}))
+        result = json.loads(model_tools.handle_function_call("web_search", {"query": "fixture"}))
+
+        assert hooks == ["web_search"]
+        assert dispatched == []
+        expected = "denied" if human_present else "no interactive user or gateway"
+        assert expected in result["error"].lower()
+        assert bool(prompts) is human_present
