@@ -165,6 +165,7 @@ def test_service_verbs_do_not_start_a_second_gateway(served_root, monkeypatch, v
     ns = argparse.Namespace(system=False, all=False, force=False, run_as_user=None)
     if verb == "restart":
         from gateway import control_socket
+        monkeypatch.setattr(gw, "find_gateway_pids", lambda *a, **k: [])
         lifecycle = []
         monkeypatch.setattr(control_socket, "request_unserve_profile",
                             lambda home, name: lifecycle.append("unserve") or {"unserved": name})

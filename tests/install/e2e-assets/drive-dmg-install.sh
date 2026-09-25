@@ -109,8 +109,7 @@ installed_app() {
   local cand
   for cand in \
     "$INSTALL_DIR/apps/desktop/release/mac-arm64/Hermes.app" \
-    "$INSTALL_DIR/apps/desktop/release/mac/Hermes.app" \
-    "/Applications/Hermes.app"; do
+    "$INSTALL_DIR/apps/desktop/release/mac/Hermes.app"; do
     [ -d "$cand" ] && return 0
   done
   return 1

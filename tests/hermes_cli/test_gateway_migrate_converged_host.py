@@ -41,6 +41,8 @@ def converged_host(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
     monkeypatch.delenv("GATEWAY_MULTIPLEX_PROFILES", raising=False)
     monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+    from hermes_cli import gateway as gw
+    monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: tmp_path / "launchd-test.plist")
     assert str(hermes_constants.get_default_hermes_root()).startswith(str(tmp_path))
 
     served = ["default", "coder", "ops"]
