@@ -58,7 +58,7 @@ def test_private_channel_generation_replay_and_fail_closed():
     assert not t.is_alive() and not t2.is_alive()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_owner_endpoint_fork_and_exec_are_revoked_without_affecting_parent():
     # Isolate fork from pytest/plugin threads. No model, live server or signals.
     code = r"""

@@ -12,6 +12,7 @@
     "exactOptionalPropertyTypes": false,
     "ignoreDeprecations": "6.0",
     "composite": true,
+    "noEmit": false,
     "declaration": true,
     "rootDir": "..",
     "outDir": "build/electron-types"
@@ -19,6 +20,10 @@
   "include": [
     "assets/trusted-runtime-manifests.json",
     "electron",
+    "product-identity.cjs",
+    "product-identity.d.cts",
+    "update-feed.cjs",
+    "update-feed.d.cts",
     "../shared/src/ansi.ts",
     "../shared/src/data-url-read-max.ts",
     "../shared/src/translucency.ts"

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
+import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -214,8 +215,8 @@ test('stored legacy registry without a runtime selection retains unrelated norma
 
 test('reviewed trust pins are carried by the existing packaged resources mechanism', () => {
   const desktop = path.resolve(import.meta.dirname, '..')
-  const config = JSON.parse(fs.readFileSync(path.join(desktop, 'package.json'), 'utf8'))
-  const resource = config.build.extraResources.find((r: any) => r.to === 'trusted-runtime-manifests.json')
+  const config = createRequire(import.meta.url)('../electron-builder.config.cjs')
+  const resource = config.extraResources.find((r: any) => r.to === 'trusted-runtime-manifests.json')
   expect(resource).toBeDefined()
   const pins = JSON.parse(fs.readFileSync(path.join(desktop, resource.from), 'utf8'))
   expect(pins.length).toBeGreaterThan(0)

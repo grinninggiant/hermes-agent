@@ -926,9 +926,9 @@ class TurnRunner:
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
         adapter = self._runner._delivery_adapter_for(ctx.source)
-        want_stream_deltas = not ctx.scheduled_heartbeat and (
-            scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
-        ) and bool(adapter is not None and getattr(adapter, "supports_response_streaming", True))
+        want_stream_deltas = (not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
+                              and adapter is not None
+                              and getattr(adapter, "supports_response_streaming", True))
         want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
         if want_stream_deltas or want_interim_messages:
             try:

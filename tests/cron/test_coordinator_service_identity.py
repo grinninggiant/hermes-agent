@@ -17,7 +17,7 @@ def service_processes(monkeypatch):
     monkeypatch.setattr(subprocess, 'run', read_process_state)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize('snapshot', [
     '502 1 /bin/sh /opt/service.sh\n503 502 /opt/hermes/bin/hermes gateway run\n',
     '502 1 ???\n',
@@ -33,13 +33,13 @@ def test_unknown_or_gateway_descendant_cannot_gain_external_service_exemption(mo
     assert contains_gateway_lifecycle_command('launchctl kickstart -k gui/501/ai.hermes.gateway-restart-coordinator')
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_external_coordinator_label_is_not_automatically_gateway_identity(service_processes):
     command = 'launchctl kickstart -k gui/501/ai.hermes.gateway-restart-coordinator'
     assert not contains_gateway_lifecycle_command(command)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_actual_gateway_lifecycle_stays_guarded(service_processes):
     command = 'launchctl kickstart -k gui/501/ai.hermes.gateway-general'
     assert contains_gateway_lifecycle_command(command)
