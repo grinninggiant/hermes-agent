@@ -12944,7 +12944,13 @@ async function runPoolBackendStart(
   })
 
   portAnnouncement.catch(() => {})
-  await claimBackendChild(child, `${backend.command} ${(ownerArgs ?? backend.args).join(' ')}`, profile, backendNonce, outputTail)
+  await claimBackendChild(
+    child,
+    `${backend.command} ${(ownerArgs ?? backend.args).join(' ')}`,
+    profile,
+    backendNonce,
+    outputTail
+  )
   assertPoolEntryStillOwned(poolKey, entry, { releaseSlot: false })
 
   child.stdout.on('data', rememberLog)
@@ -13309,7 +13315,9 @@ function startHermes({ supervisorRecovery = false }: { supervisorRecovery?: bool
   primaryRecoverySuppressed = false
   primaryStartsInFlight += 1
 
-  const start = startupEffects.startBackend(() => localBackendLifecycle.start(() => runHermesStart({ supervisorRecovery })))
+  const start = startupEffects.startBackend(() =>
+    localBackendLifecycle.start(() => runHermesStart({ supervisorRecovery }))
+  )
 
   const releaseStart = () => {
     primaryStartsInFlight -= 1

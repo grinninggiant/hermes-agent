@@ -12,13 +12,22 @@ describe('startup external effects', () => {
     expect(start).toHaveBeenCalledExactlyOnceWith()
     expect(startupEffects.checkForUpdates(() => pending)).toBe(pending)
 
-    for (const effect of [startupEffects.stopBackend, startupEffects.registerProtocol,
-      startupEffects.warmShell, startupEffects.recoverStartup, startupEffects.integrateDesktop]) {
+    for (const effect of [
+      startupEffects.stopBackend,
+      startupEffects.registerProtocol,
+      startupEffects.warmShell,
+      startupEffects.recoverStartup,
+      startupEffects.integrateDesktop
+    ]) {
       const operation = vi.fn(() => value)
       expect(effect(operation)).toBe(value)
       expect(operation).toHaveBeenCalledExactlyOnceWith()
       const failure = new Error('delegated failure')
-      expect(() => effect(() => { throw failure })).toThrow(failure)
+      expect(() =>
+        effect(() => {
+          throw failure
+        })
+      ).toThrow(failure)
     }
 
     const reap = vi.fn(() => Promise.resolve())
@@ -27,7 +36,9 @@ describe('startup external effects', () => {
   })
 
   it('isolated build never invokes supplied external operations', async () => {
-    const forbidden = vi.fn(() => { throw new Error('external effect executed') })
+    const forbidden = vi.fn(() => {
+      throw new Error('external effect executed')
+    })
     await expect(isolatedEffects.startBackend(forbidden)).rejects.toThrow('isolated startup smoke')
     await expect(isolatedEffects.checkForUpdates(forbidden)).rejects.toThrow('isolated startup smoke')
     await isolatedEffects.reapBackends(forbidden)

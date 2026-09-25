@@ -197,13 +197,15 @@ test('host attachment never bypasses exact runtime selection or a recovery fence
 
 test('an in-flight host attachment rejects a newer runtime selection', async () => {
   const f = fixture()
-  await expect(f.controller.attachHostBackend(async () => {
-    const changed = f.store.read()
-    changed.connections[0].generalRuntime = { generation: 1, coordinate: f.candidate }
-    f.store.write(changed)
+  await expect(
+    f.controller.attachHostBackend(async () => {
+      const changed = f.store.read()
+      changed.connections[0].generalRuntime = { generation: 1, coordinate: f.candidate }
+      f.store.write(changed)
 
-    return { pid: 42 }
-  })).rejects.toThrow(/stale/)
+      return { pid: 42 }
+    })
+  ).rejects.toThrow(/stale/)
 })
 
 test('offline entry activates with exact readback, refuses unsafe states and recovers persistent CAS', async () => {

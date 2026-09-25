@@ -10,7 +10,10 @@ import { normalizeConnectionInput, normalizeRegistry, parseStoredRegistry } from
 import { changeRuntimeSelection, resolveConnectionRuntime } from './connection-runtime'
 
 test('exact local runtimes never share another profile backend, including scoped REST requests', () => {
-  for (const [profile, primaryProfile] of [['general', 'default'], ['default', 'general']]) {
+  for (const [profile, primaryProfile] of [
+    ['general', 'default'],
+    ['default', 'general']
+  ]) {
     for (const requestPath of [undefined, '/api/config', '/api/sessions', '/api/actions/job/status']) {
       const opts = { primaryProfile, exactLocalRuntime: true, requestPath, requestMethod: 'GET' }
       expect(resolveProfileBackendRoute(profile, opts).backend).toBe('pool')
@@ -19,7 +22,9 @@ test('exact local runtimes never share another profile backend, including scoped
     }
   }
 
-  expect(resolveProfileBackendRoute('general', { primaryProfile: 'general', exactLocalRuntime: true }).backend).toBe('primary')
+  expect(resolveProfileBackendRoute('general', { primaryProfile: 'general', exactLocalRuntime: true }).backend).toBe(
+    'primary'
+  )
 })
 
 test('registry roundtrip preserves scoped selection; CAS prevents replay and rollback restores unset', () => {
@@ -178,7 +183,10 @@ test('stored registry rejects ambiguous local identity before normalization can 
     { id: 'local', kind: 'ssh', host: 'example.com' },
     { id: 'local', kind: 'unknown' }
   ]) {
-    for (const connections of [[conflict, local], [local, conflict]]) {
+    for (const connections of [
+      [conflict, local],
+      [local, conflict]
+    ]) {
       expect(() => parseStoredRegistry(JSON.stringify({ ...registry, connections }))).toThrow(
         /Invalid stored connections registry/
       )
