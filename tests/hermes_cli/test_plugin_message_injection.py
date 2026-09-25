@@ -4,7 +4,7 @@ from queue import SimpleQueue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import yaml
+import hermes_yaml as yaml
 import pytest
 
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -38,6 +38,21 @@ def test_guarded_injection_requires_exact_binding_and_sync_guard(tmp_path, monke
     assert context.inject_message("wake", session_key="agent:main:telegram:dm:42",
                                   expected_session_id=binding, dispatch_guard=guard) is False
     injector.assert_not_called()
+
+
+def test_bound_gateway_injection_never_uses_unbound_tui_host(tmp_path, monkeypatch):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    tui = MagicMock(return_value=True)
+    gateway = MagicMock(return_value=True)
+    manager.set_tui_message_injector(object(), tui)
+    manager.set_gateway_message_injector(object(), gateway)
+    guard = lambda: True
+    assert context.inject_message("wake", session_key="session-key",
+                                  expected_session_id="original-session", dispatch_guard=guard) is True
+    tui.assert_not_called()
+    assert gateway.call_args.kwargs["expected_session_id"] == "original-session"
+    assert gateway.call_args.kwargs["dispatch_guard"]() is True
 
 
 def test_guard_returning_coroutine_is_rejected_without_leaking_it(tmp_path, monkeypatch, recwarn):

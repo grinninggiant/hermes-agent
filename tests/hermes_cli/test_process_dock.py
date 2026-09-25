@@ -1,4 +1,5 @@
 """Background processes share the classic CLI live-work dock with subagents (Processes block)."""
+import sys
 import time
 from types import SimpleNamespace
 
@@ -53,10 +54,12 @@ def test_dock_paints_processes_under_agents_and_retires_finished_rows(monkeypatc
         process_registry.kill_process(slow_id)
 
 
-def test_monitor_controls_stop_processes_and_never_steer_them():
+def test_monitor_controls_stop_processes_and_never_steer_them(monkeypatch):
     from hermes_cli.cli_subagent_monitor import SubagentMonitor
     from tools.process_registry import process_registry
 
+    monkeypatch.setattr(process_registry, '_scope_argv',
+                        lambda *a: [sys.executable, '-c', 'import time; time.sleep(30)'])
     slow = process_registry.spawn_local(command="sleep 30", cwd='.', task_id='t', owner_task_id='t', session_key='')
     slow_id = slow.id
     try:
@@ -66,7 +69,8 @@ def test_monitor_controls_stop_processes_and_never_steer_them():
         assert dock.selected_process is not None
         assert 'error' in dock.control('steer', 'nope')
         assert process_registry.get(slow_id).exited is False
-        assert dock.control('stop')['status'] == 'killed'
+        result = dock.control('stop')
+        assert result['status'] == 'killed', result
         _wait(lambda: process_registry.get(slow_id).exited)
         dock.refresh()
         assert any(r['id'] == slow_id and r['status'] == 'killed' for r in dock.processes)

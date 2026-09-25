@@ -34,6 +34,7 @@ def quiet_host(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
     monkeypatch.setattr(gw, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(gw, "is_macos", lambda: False)  # Simulated systemd host must ignore real launchd plists.
     monkeypatch.setattr(gw, "_service_backend", lambda: "systemd")
     monkeypatch.setattr(gw, "refuses_container_user_scope_install", lambda system: False)
     monkeypatch.setattr(gw, "_dispatch_via_service_manager_if_s6", lambda v: False)

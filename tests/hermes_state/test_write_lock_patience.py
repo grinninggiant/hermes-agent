@@ -88,7 +88,7 @@ class TestTranscriptWritePatience:
 
         started = threading.Event()
         holder = threading.Thread(
-            target=_hold_write_lock, args=(db.db_path, 2.0, started)
+            target=_hold_write_lock, args=(db.db_path, 6.0, started)
         )
         holder.start()
         try:

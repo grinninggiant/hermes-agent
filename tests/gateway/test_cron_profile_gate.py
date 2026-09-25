@@ -76,6 +76,9 @@ def test_gateway_passes_a_profile_gate_to_the_cron_ticker(tmp_path, monkeypatch)
         def start(self):
             pass
 
+        def restart_if_dead(self):
+            return False
+
     monkeypatch.setattr(
         gw_run, "_cron_tick_profile_homes", lambda _cfg: [("default", tmp_path), ("b", home_b)])
     monkeypatch.setattr(

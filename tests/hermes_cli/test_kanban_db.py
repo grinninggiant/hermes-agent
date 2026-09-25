@@ -51,7 +51,7 @@ def _init_git_repo(repo: Path) -> None:
 
 
 
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):
     """Windows must use a real (non-blocking) process lock, not a no-op open.
 
@@ -59,7 +59,7 @@ def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypa
     wedged holder can never block connect() forever; a clean acquire takes the
     lock once and releases it once.
 
-    ``windows_only``: ``msvcrt`` does not exist off Windows, so faking
+    ``platforms("windows")``: ``msvcrt`` does not exist off Windows, so faking
     ``_IS_WINDOWS`` on Linux meant injecting a fake ``msvcrt`` module too —
     the test then asserted against its own stub rather than the byte-range
     locking API. Here the platform is real; only ``msvcrt.locking`` is
@@ -562,6 +562,7 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
     failure on the same card still counts."""
     import tools.process_registry as process_registry
 
+    monkeypatch.setattr(process_registry, "_IS_LINUX", True)
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)

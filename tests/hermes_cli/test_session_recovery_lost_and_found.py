@@ -225,6 +225,7 @@ def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
     import hermes_cli.session_lost_and_found as laf
 
     monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: None)
+    monkeypatch.setattr(laf, "find_sqlite3_cli_refusal", lambda: {"reason": "missing"})
     with pytest.raises(SessionRecoverySourceError) as excinfo:
         recover_session_database(
             source,
@@ -1183,7 +1184,7 @@ def test_recovery_lane_refuses_to_verify_when_rows_matched_no_layout(
 # ── .recover stderr pipe must be drained while the child runs ──────────────
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="stub sqlite3 is a /bin/sh script")
+@pytest.mark.platforms("posix")  # stub sqlite3 is a /bin/sh script
 def test_recover_attempts_survive_dump_stderr_beyond_pipe_buffer(tmp_path: Path) -> None:
     """A heavily damaged source makes ``.recover`` emit per-page diagnostics on
     stderr. Past the OS pipe buffer (~64KB) an undrained stderr blocks the dump

@@ -4378,6 +4378,7 @@ export interface MessageCompletePayload {
   reasoning?: string | null
   warning?: string | null
   response_previewed?: boolean | null
+  response_transformed?: boolean | null
   billing?: BillingBlock | null
   failure_reason?: string | null
   rendered?: string | null

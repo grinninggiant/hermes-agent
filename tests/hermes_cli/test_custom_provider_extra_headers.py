@@ -209,7 +209,7 @@ def test_fetch_api_models_sends_extra_headers_to_models_probe(monkeypatch):
         def read(self):
             return json.dumps({"data": [{"id": "proxy-model"}]}).encode()
 
-    def fake_urlopen(request, timeout=0):
+    def fake_urlopen(request, timeout=0, *, ssl_context=None):
         captured["url"] = request.full_url
         captured["timeout"] = timeout
         captured["headers"] = {

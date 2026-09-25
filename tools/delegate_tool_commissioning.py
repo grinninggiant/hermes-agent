@@ -57,7 +57,8 @@ _CONTINUATION = (
 def _write_artifact(path, value):
     # Exclusive creation prevents reuse/overwrite and makes the retained result owner-only.
     import os
-    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as stream:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
         json.dump(value, stream, sort_keys=True, indent=2)
 
 

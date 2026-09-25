@@ -674,12 +674,41 @@ async function pidIsOurDashboard(
     ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
     ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
     'except OSError:\n' +
-    ' try:\n' +
-    '  line=subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip()\n' +
-    ' except subprocess.CalledProcessError:\n' +
-    '  # pid already gone — a dead process is FOREIGN, not a transport error\n' +
-    '  print("FOREIGN");sys.exit(0)\n' +
-    ' args=shlex.split(line)\n' +
+    ' if sys.platform=="darwin":\n' +
+    '  # ps loses argv boundaries for paths containing spaces; use the kernel record.\n' +
+    '  import ctypes\n' +
+    '  try:\n' +
+    '   libc=ctypes.CDLL("/usr/lib/libSystem.B.dylib",use_errno=True)\n' +
+    '   libc.sysctl.argtypes=[ctypes.POINTER(ctypes.c_int),ctypes.c_uint,ctypes.c_void_p,ctypes.POINTER(ctypes.c_size_t),ctypes.c_void_p,ctypes.c_size_t]\n' +
+    '   mib=(ctypes.c_int*3)(1,49,pid) # CTL_KERN, KERN_PROCARGS2\n' +
+    '   size=ctypes.c_size_t()\n' +
+    '   if libc.sysctl(mib,3,None,ctypes.byref(size),None,0):raise OSError("argv size unavailable")\n' +
+    '   if not 5<=size.value<=4194304:raise ValueError("invalid argv size")\n' +
+    '   buf=ctypes.create_string_buffer(size.value)\n' +
+    '   if libc.sysctl(mib,3,buf,ctypes.byref(size),None,0):raise OSError("argv unavailable")\n' +
+    '   raw=buf.raw[:size.value]\n' +
+    '   argc=int.from_bytes(raw[:4],sys.byteorder,signed=True)\n' +
+    '   start=raw.find(b"\\0",4)+1\n' +
+    '   if not 0<argc<=4096 or start<=4:raise ValueError("invalid argv header")\n' +
+    '   while start<len(raw) and raw[start]==0:start+=1\n' +
+    '   args=[]\n' +
+    '   for _ in range(argc):\n' +
+    '    end=raw.find(b"\\0",start)\n' +
+    '    if end<=start:raise ValueError("truncated argv")\n' +
+    '    args.append(raw[start:end].decode("utf-8","surrogateescape"))\n' +
+    '    start=end+1\n' +
+    '  except (OSError,ValueError,UnicodeError,IndexError):\n' +
+    '   try:os.kill(pid,0)\n' +
+    '   except ProcessLookupError:print("FOREIGN");sys.exit(0)\n' +
+    '   except OSError:pass\n' +
+    '   sys.exit(2)\n' +
+    ' else:\n' +
+    '  try:\n' +
+    '   line=subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip()\n' +
+    '  except subprocess.CalledProcessError:\n' +
+    '   # pid already gone — a dead process is FOREIGN, not a transport error\n' +
+    '   print("FOREIGN");sys.exit(0)\n' +
+    '  args=shlex.split(line)\n' +
     'ok=False\n' +
     'try:\n' +
     ' serve=args.index("serve")\n' +
@@ -1135,8 +1164,10 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
     `ulimit -n ${REMOTE_NOFILE_SOFT_LIMIT} 2>/dev/null || true; ` +
     `exec env HERMES_DESKTOP=1${opts.guestOnboarding === true ? ' HERMES_GUEST_ONBOARDING=1' : ''} ${hermes} ${profileArgs}${subCmd}`
 
-  const detachedShell = `eval "exec $1>&-"; ${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`
-  const detachedSpawn = `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(detachedShell)} hermes-update-child "$1" & echo $!)`
+  const detachedShell: string = `eval "exec $1>&-"; ${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`
+  // The inner shell backgrounds Hermes and reports its PID; backgrounding the
+  // launcher too adds its unrelated PID to the value published in the lock.
+  const detachedSpawn: string = `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(detachedShell)} hermes-update-child "$1")`
 
   if (!opts.ownershipId || !opts.lockMetadata) {
     return withRemoteUpdateMutex(
@@ -1179,8 +1210,9 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
       // ${var//pat/rep} is a bashism — this payload runs under plain sh (dash
       // on Ubuntu), which aborts the whole script on it with "Bad
       // substitution" AFTER the child was spawned, orphaning the backend and
-      // skipping the lockfile publication. Substitute with sed instead.
-      `lock_json=$(printf '%s' ${shq(metadata)} | sed "s/__PID__/\${child}/"); ` +
+      // skipping the lockfile publication. Replace the quoted PID field with
+      // a JSON number so readLockfile and concurrent spawns accept the record.
+      `lock_json=$(printf '%s' ${shq(metadata)} | sed "s/\\"pid\\":\\"__PID__\\"/\\"pid\\":\${child}/"); ` +
       `temporary_lock="\${lock}.${reservationNonce}.tmp"; ` +
       `printf '%s' "$lock_json" > "$temporary_lock" && mv -f "$temporary_lock" "$lock" || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 76; }; ` +
       `echo "$child"`,
