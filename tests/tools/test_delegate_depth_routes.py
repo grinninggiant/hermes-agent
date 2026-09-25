@@ -3,7 +3,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from tests.tools.test_delegate import _make_mock_parent

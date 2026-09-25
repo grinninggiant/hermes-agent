@@ -212,7 +212,8 @@ class TestQuotaExhaustedIsNotAnAuthFailure:
                                  _get_system_prompt_for_channel=lambda *a, **k: "",
                                  _ephemeral_system_prompt="")
         ctx = TurnContext(source=SessionSource(platform=Platform.SLACK, chat_id="C1", chat_type="dm"),
-                          session_key="slack:C1", user_config={}, message="Hi")
+                          session_key="slack:C1", user_config={}, message="Hi",
+                          _run_still_current=lambda: True)
         result = TurnRunner(runner, ctx).run_sync()
         reply = result["final_response"]
         assert "/login" not in reply and "resets in ~33h" in reply and result["api_calls"] == 0
