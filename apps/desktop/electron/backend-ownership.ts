@@ -312,6 +312,17 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
 }
 
 export function backendCommandMatches(command: unknown): boolean {
+  // The private bootstrap is only launched directly by Python for explicit General.
+  // Anchor at the executable: a script, -c payload or argv mention is not ownership.
+  if (
+    typeof command === 'string' &&
+    /^(?:"(?:[^"\r\n]*[/\\])?python(?:3(?:\.\d+)?)?(?:\.exe)?"|(?:[^\s"\r\n]*[/\\])?python(?:3(?:\.\d+)?)?(?:\.exe)?)\s+-m\s+tui_gateway\.owner_bootstrap\s+--profile\s+general\s+serve(?:\s|$)/.test(
+      command
+    )
+  ) {
+    return true
+  }
+
   return /(?:^|[\s/\\"])(?:hermes(?:\.exe)?|hermes_cli\.main|hermes_cli[/\\]main\.py)"?(?:\s+(?:--profile|-p)\s+\S+)?\s+(?:serve|dashboard)(?:\s|$)/i.test(
     String(command ?? '')
   )
@@ -320,17 +331,36 @@ export function backendCommandMatches(command: unknown): boolean {
 /** Coordinates all quit paths so asynchronous backend teardown runs once. */
 export function createBackendShutdownCoordinator(teardown: () => Promise<void> | void) {
   let completion: Promise<void> | undefined
+  let settled = false
 
   return {
     run(): Promise<void> {
       if (!completion) {
-        completion = Promise.resolve().then(teardown)
+        try {
+          // Invoke synchronously so no-wait quit paths still invalidate cached
+          // connection state and stop timers before Electron exits.
+          completion = Promise.resolve(teardown())
+        } catch (error) {
+          completion = Promise.reject(error)
+        }
+
+        void completion.then(
+          () => {
+            settled = true
+          },
+          () => {
+            settled = true
+          }
+        )
       }
 
       return completion
     },
     hasStarted(): boolean {
       return completion !== undefined
+    },
+    isPending(): boolean {
+      return completion !== undefined && !settled
     }
   }
 }

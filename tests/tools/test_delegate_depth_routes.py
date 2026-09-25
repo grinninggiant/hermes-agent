@@ -72,6 +72,24 @@ def test_depth_routes_are_exact_and_depth_derived(tmp_path, monkeypatch, depth, 
     assert child["request_overrides"] == {}
 
 
+def test_depth_routes_are_profile_local_a_b_a(tmp_path, monkeypatch):
+    from agent.secret_scope import set_multiplex_active
+
+    homes = [tmp_path / name for name in ("a", "b")]
+    for home in homes:
+        home.mkdir()
+    set_multiplex_active(True)
+    try:
+        for home in (homes[0], homes[1], homes[0]):
+            cfg = {"max_spawn_depth": 3, "depth_routes": {
+                1: {"provider": "openai-codex", "model": f"model-{home.name}"}}}
+            result, built, _ = _spawn(home, monkeypatch, cfg)
+            assert result["results"][0]["status"] == "completed"
+            assert built[0]["model"] == f"model-{home.name}"
+    finally:
+        set_multiplex_active(False)
+
+
 def test_depth_route_without_effort_inherits_parent_not_global(tmp_path, monkeypatch):
     cfg = {"max_spawn_depth": 3, "reasoning_effort": "high",
            "depth_routes": {"1": {"model": "gpt-6-luna", "provider": "openai-codex"}}}

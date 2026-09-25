@@ -9,7 +9,9 @@ BASE = "ops239-ec8e0050-guidance"
 CAND = "ops239-b7013cf0-guidance"
 
 
-def test_closed_immutable_package_and_native_slots(tmp_path, monkeypatch):
+@pytest.mark.parametrize("oneshot", [False, True])
+def test_closed_immutable_package_and_native_slots(tmp_path, monkeypatch, oneshot):
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1" if oneshot else "0")
     from agent.instruction_package import resolve_instruction_package
     from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
     from agent.system_prompt import _skills_prompt
@@ -40,6 +42,10 @@ def test_closed_immutable_package_and_native_slots(tmp_path, monkeypatch):
     assert native == _skills_prompt(SimpleNamespace(valid_tool_names={"skill_view", "terminal"}, platform="cli"))
     before, after = assemble(BASE), assemble(CAND)
     assert before != after
+    for package, prompt in ((baseline, before), (candidate, after)):
+        assert package is not None
+        assert package.skills_lead.format(basic_tools="terminal") in prompt
+        assert package.skills_tail in prompt
     assert before.replace(baseline.skills_lead.format(basic_tools="terminal"), candidate.skills_lead).replace(baseline.skills_tail, candidate.skills_tail) == after
     with ThreadPoolExecutor(max_workers=2) as pool:
         values = list(pool.map(assemble, [BASE, CAND] * 8))

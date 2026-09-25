@@ -109,7 +109,7 @@ def test_same_name_nested_tool_keeps_its_own_post_hook():
 @pytest.mark.parametrize("sequential", [False, True])
 def test_connector_batch_entry_keeps_execution_context(monkeypatch, sequential):
     from tools.registry import invalidate_check_fn_cache
-    from tools.tool_gateway import bridge, config
+    from tools.connectors.gateway import bridge, config
 
     monkeypatch.setattr(config, "connectors_available", lambda: True)
     monkeypatch.setattr(bridge, "connectors_available", lambda: True)
@@ -153,7 +153,7 @@ def test_connector_batch_entry_keeps_execution_context(monkeypatch, sequential):
 @pytest.mark.parametrize("sequential", [False, True])
 def test_background_review_connector_pre_hook_blocks_before_remote_dispatch(monkeypatch, sequential):
     from tools.registry import invalidate_check_fn_cache
-    from tools.tool_gateway import bridge, config
+    from tools.connectors.gateway import bridge, config
 
     monkeypatch.setattr(config, "connectors_available", lambda: True)
     monkeypatch.setattr(bridge, "connectors_available", lambda: True)

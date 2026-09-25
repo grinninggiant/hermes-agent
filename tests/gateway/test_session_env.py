@@ -78,20 +78,33 @@ def test_set_session_env_sets_contextvars(monkeypatch):
 
 
 def test_unrouted_session_binds_actual_serving_profile(tmp_path, monkeypatch):
-    home = tmp_path / ".hermes" / "profiles" / "general"
-    home.mkdir(parents=True)
+    from agent.secret_scope import set_multiplex_active
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    homes = [tmp_path / ".hermes" / "profiles" / name for name in ("general", "other")]
+    for home in homes:
+        home.mkdir(parents=True)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(homes[0]))
     runner = object.__new__(GatewayRunner)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="session")
     context = SessionContext(source=source, connected_platforms=[], home_channels={})
 
-    tokens = runner._set_session_env(context)
+    set_multiplex_active(True)
     try:
-        assert source.profile is None  # No configured cross-profile route.
-        assert get_session_env("HERMES_SESSION_PROFILE") == "general"
+        for home in (homes[0], homes[1], homes[0]):
+            home_token = set_hermes_home_override(home)
+            try:
+                tokens = runner._set_session_env(context)
+                try:
+                    assert source.profile is None  # No configured cross-profile route.
+                    assert get_session_env("HERMES_SESSION_PROFILE") == home.name
+                finally:
+                    runner._clear_session_env(tokens)
+            finally:
+                reset_hermes_home_override(home_token)
     finally:
-        runner._clear_session_env(tokens)
+        set_multiplex_active(False)
 
 
 def test_clear_session_env_restores_previous_state(monkeypatch):
@@ -351,4 +364,47 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
 
     reset_session_vars()
     assert get_session_env("HERMES_CRON_SESSION") == "1"
+
+
+@pytest.mark.asyncio
+async def test_plugin_slash_command_sees_session_env(monkeypatch):
+    """A plugin-registered slash command handler must see the same HERMES_SESSION_*
+    contextvars an agent turn would for that event (#108698): the agent-turn path binds
+    them via _set_session_env before running, but plugin command dispatch is a separate,
+    earlier path that previously called the handler with nothing bound."""
+    from gateway.config import GatewayConfig, PlatformConfig
+    from gateway.platforms.event import MessageEvent
+
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")})
+    runner._draining = False
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", user_name="tester", chat_type="dm",
+    )
+    event = MessageEvent(text="/gsd bind", source=source, message_id="m1")
+
+    seen = {}
+
+    def _handler(raw_args):
+        seen["session_key"] = get_session_env("HERMES_SESSION_KEY")
+        seen["chat_id"] = get_session_env("HERMES_SESSION_CHAT_ID")
+        return f"Bound: {raw_args}"
+
+    from hermes_cli import plugins as _plugins_mod
+    monkeypatch.setattr(_plugins_mod, "get_plugin_command_handler",
+                         lambda name: _handler if name == "gsd-bind" else None)
+
+    handled, result, command = await runner._hm_dispatch_quick_and_plugin_commands(event, source, "gsd_bind")
+
+    assert handled is True
+    assert result == "Bound: bind"
+    assert seen["session_key"] == runner._session_key_for_source(source)
+    assert seen["session_key"] != ""
+    assert seen["chat_id"] == "c1"
+    # Bound only for the handler call, not leaked past dispatch
+    assert get_session_env("HERMES_SESSION_KEY") == ""
 

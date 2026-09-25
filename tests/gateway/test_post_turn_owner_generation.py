@@ -67,15 +67,13 @@ async def test_stale_post_turn_cleanup_preserves_replacement_slot_and_lease():
     )
     state.turn.agent = object()
     state.turn.lease = old_slot
-    state.turn.lease_token = old_token
-    state.turn.lease_generation = old_generation
+    state.turn.lease_tokens[old_generation] = old_token
 
     # This is the real boundary handoff: release N's resources, then admit N+1.
     old_slot.release()
     assert runner._turn_leases.release(old_token)
     state.turn.lease = None
-    state.turn.lease_token = None
-    state.turn.lease_generation = None
+    state.turn.lease_tokens.pop(old_generation)
     new_generation = runner._begin_session_run_generation(key)
     assert new_generation == old_generation + 1
     new_slot = _active_lease(key)
@@ -84,14 +82,13 @@ async def test_stale_post_turn_cleanup_preserves_replacement_slot_and_lease():
     )
     state.turn.agent = object()
     state.turn.lease = new_slot
-    state.turn.lease_token = new_token
-    state.turn.lease_generation = new_generation
+    state.turn.lease_tokens[new_generation] = new_token
 
     assert runner._release_running_agent_state(key, run_generation=old_generation) is False
     assert runner._release_turn_lease(key, old_generation) is False
     assert state.turn.agent is not None
     assert state.turn.lease is new_slot
-    assert state.turn.lease_token is new_token
+    assert state.turn.lease_tokens[new_generation] is new_token
     assert not new_token.released
     assert len(_active_entries()) == 1
     assert _active_entries()[0]["lease_id"] == new_slot.lease_id
@@ -108,8 +105,7 @@ async def _run_turn_that_owns_a_lease(runner, event, started=None, wait=False):
         "transcript", owner_key=key, generation=generation
     )
     state = runner._session_state(key)
-    state.turn.lease_token = token
-    state.turn.lease_generation = generation
+    state.turn.lease_tokens[generation] = token
     if started is not None:
         started.set()
     if wait:
@@ -150,7 +146,7 @@ async def test_post_turn_owner_releases_real_slot_and_turn_lease_on_exception():
 
     state = runner._session_state(key)
     assert state.turn.agent is None
-    assert state.turn.lease_token is None
+    assert state.turn.lease_tokens == {}
     assert runner._post_turn_work_owners == {}
     assert _active_entries() == []
     assert runner._turn_leases._leases["transcript"].holder is None
@@ -169,7 +165,7 @@ async def test_post_turn_owner_releases_real_slot_and_turn_lease_on_cancellation
 
     state = runner._session_state(key)
     assert state.turn.agent is None
-    assert state.turn.lease_token is None
+    assert state.turn.lease_tokens == {}
     assert runner._post_turn_work_owners == {}
     assert _active_entries() == []
     assert runner._turn_leases._leases["transcript"].holder is None

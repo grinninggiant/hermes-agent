@@ -36,6 +36,7 @@ import {
   normAuthMode
 } from './connection-config'
 import { matchingConnectionId, type StoredRoute } from './connection-route-identity'
+import { normalizeRuntimeSelection, type RuntimeSelection } from './connection-runtime'
 
 export const REGISTRY_VERSION = 2
 
@@ -47,6 +48,8 @@ export const LOCAL_CONNECTION_ID = 'local'
 export type ConnectionKind = 'cloud' | 'local' | 'remote' | 'ssh'
 
 export interface RegistryConnection {
+  /** Native-managed opt-in for local/general only; never renderer executable input. */
+  generalRuntime?: RuntimeSelection
   id: string
   kind: ConnectionKind
   /** Required, unique (case-insensitive) display name — the "device name". */
@@ -840,6 +843,17 @@ export interface ConnectionInput {
  * uniqueness context; when `input.id` matches an existing entry this is an
  * edit and that entry is excluded from the label-collision check.
  */
+/**
+ * Auth mode a stored remote-shaped entry actually uses. A Hermes Cloud gateway
+ * signs in through its OAuth session and never keeps a pasted token (the save
+ * path drops one), so a cloud entry on token auth with no token has no
+ * credential at all and Test can only fail (#89529). Read it as oauth; a cloud
+ * entry that does carry a token keeps its mode.
+ */
+function storedAuthMode(kind: ConnectionKind, authMode: unknown, token: unknown): 'oauth' | 'token' {
+  return kind === 'cloud' && !token ? 'oauth' : normAuthMode(authMode)
+}
+
 export function normalizeConnectionInput(input: ConnectionInput, registry: ConnectionRegistry): RegistryConnection {
   const label = String(input.label || '').trim()
 
@@ -861,8 +875,10 @@ export function normalizeConnectionInput(input: ConnectionInput, registry: Conne
   const kind = input.kind
 
   if (kind === 'local') {
-    // The local entry is managed by the app; only its label is editable.
-    return { id: LOCAL_CONNECTION_ID, kind: 'local', label }
+    // Runtime selection is native-managed; editor payloads cannot replace it.
+    const retained = registry.connections.find(c => c.id === LOCAL_CONNECTION_ID)?.generalRuntime
+
+    return { id: LOCAL_CONNECTION_ID, kind: 'local', label, ...(retained ? { generalRuntime: retained } : {}) }
   }
 
   // The reserved local id can never be claimed by a non-local entry — a
@@ -939,7 +955,8 @@ export function normalizeConnectionInput(input: ConnectionInput, registry: Conne
       throw new Error(`A connection to this gateway URL already exists ("${urlDupe.label}").`)
     }
 
-    const authMode = normAuthMode(input.authMode)
+    // Cloud never stores a token (below), so it is always oauth.
+    const authMode = storedAuthMode(kind, input.authMode, undefined)
     const entry: RegistryConnection = { id, kind, label, url, authMode }
 
     // A token is only meaningful for token-auth remotes. Dropping it here is
@@ -1092,6 +1109,30 @@ function localEntry(label = 'This device'): RegistryConnection {
  * corrupt file degrades to a minimal local-only registry rather than
  * throwing at boot.
  */
+/** Authoritative disk reads are not first-run defaults. Failure leaves the caller's cache untouched. */
+export function parseStoredRegistry(text: string): ConnectionRegistry {
+  const raw = JSON.parse(text)
+
+  if (
+    !raw ||
+    raw.version !== REGISTRY_VERSION ||
+    !Array.isArray(raw.connections) ||
+    raw.connections.filter((c: any) => c?.kind === 'local' && c?.id === LOCAL_CONNECTION_ID).length !== 1 ||
+    // Normalization rewrites local-kind IDs and trims other IDs before de-duplication.
+    // Reject every competing local identity before it can discard the authoritative selection.
+    raw.connections.filter((c: any) => c?.kind === 'local' || String(c?.id || '').trim() === LOCAL_CONNECTION_ID)
+      .length !== 1
+  ) {
+    throw new Error('Invalid stored connections registry')
+  }
+
+  if (raw.quarantined?.some((q: any) => q?.entry && Object.hasOwn(q.entry, 'generalRuntime'))) {
+    throw new Error('Quarantined runtime selection requires explicit recovery')
+  }
+
+  return normalizeRegistry(raw)
+}
+
 export function normalizeRegistry(raw: unknown): ConnectionRegistry {
   const parsed = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
   const rawConnections = Array.isArray(parsed.connections) ? parsed.connections : []
@@ -1142,6 +1183,15 @@ export function normalizeRegistry(raw: unknown): ConnectionRegistry {
       continue
     }
 
+    // Runtime identity is authoritative: never quarantine it into an unset default.
+    if ('generalRuntime' in item) {
+      if (item.kind !== 'local') {
+        throw new Error('Unsupported runtime scope')
+      }
+
+      normalizeRuntimeSelection(item.generalRuntime)
+    }
+
     // One bad entry must never abort the whole registry load (#94246): any
     // unexpected throw quarantines THIS entry and the loop moves on.
     try {
@@ -1180,6 +1230,14 @@ export function normalizeRegistry(raw: unknown): ConnectionRegistry {
 
       const clean: RegistryConnection = { id, kind, label }
 
+      if (entry.generalRuntime !== undefined) {
+        if (kind !== 'local') {
+          throw new Error('Unsupported runtime scope')
+        }
+
+        clean.generalRuntime = normalizeRuntimeSelection(entry.generalRuntime)
+      }
+
       if (kind === 'remote' || kind === 'cloud') {
         const url = String(entry.url || '').trim()
 
@@ -1190,7 +1248,7 @@ export function normalizeRegistry(raw: unknown): ConnectionRegistry {
         }
 
         clean.url = url
-        clean.authMode = normAuthMode(entry.authMode)
+        clean.authMode = storedAuthMode(kind, entry.authMode, entry.token)
 
         if (entry.token !== undefined) {
           clean.token = entry.token

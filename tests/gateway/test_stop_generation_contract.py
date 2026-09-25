@@ -25,7 +25,7 @@ async def test_worker_admission_rechecks_policy_and_generation_after_awaits(inte
     adapter = _ContinuationAdapter()
     runner = object.__new__(GatewayRunner)
     runner._profile_scope_for_source = lambda _source: nullcontext()
-    runner._adapter_for_source = lambda _source: adapter
+    runner._delivery_adapter_for = lambda _source: adapter
     runner._session_key_for_source = lambda _source: key
     runner.session_store = object()
     generation = runner._begin_session_run_generation(key)
@@ -109,7 +109,7 @@ async def test_targeted_interrupt_cannot_signal_or_clean_successor(boundary):
     key = build_session_key(source)
     runner = object.__new__(GatewayRunner)
     runner._session_key_for_source = lambda _source: key
-    runner._adapter_for_source = lambda _source: adapter
+    runner._delivery_adapter_for = lambda _source: adapter
     runner._persist_active_agents = lambda: None
     runner.session_store = object()
     runner._agent_cache = {}

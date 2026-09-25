@@ -76,7 +76,7 @@ async def test_recursive_internal_turn_is_rejected_before_worker_when_veto_flips
     event = MessageEvent(text="wake", source=source, internal=True)
     runner = object.__new__(GatewayRunner)
     runner._profile_scope_for_source = lambda _source: nullcontext()
-    runner._adapter_for_source = lambda _source: type(
+    runner._delivery_adapter_for = lambda _source: type(
         "Adapter", (), {"_execution_allowed": AsyncMock(return_value=False)}
     )()
     runner._run_agent_inner = AsyncMock(side_effect=AssertionError("worker launched"))
@@ -103,7 +103,7 @@ async def test_recursive_internal_turn_is_rejected_for_mismatched_pinned_session
     })
     runner = object.__new__(GatewayRunner)
     runner._profile_scope_for_source = lambda _source: nullcontext()
-    runner._adapter_for_source = lambda _source: type(
+    runner._delivery_adapter_for = lambda _source: type(
         "Adapter", (), {"_execution_allowed": AsyncMock(return_value=True)}
     )()
     runner._session_key_for_source = lambda _source: session_key

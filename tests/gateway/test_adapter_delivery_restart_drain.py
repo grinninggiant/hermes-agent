@@ -7,7 +7,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platforms.event import ProcessingOutcome
-from tests.gateway.test_42039_duplicate_user_message import _bootstrap
+from tests.gateway.test_duplicate_user_message import _bootstrap
 from tests.gateway.test_platform_continuation_seam import _ContinuationAdapter, _event
 
 

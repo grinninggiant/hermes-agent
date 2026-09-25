@@ -84,7 +84,7 @@ async def test_claimed_answer_delivery_preserves_goal_handoff_and_schedules_once
     finally:
         reopened.close_all_db_handles()
 
-    runner._adapter_for_source = lambda source: runner.adapters[Platform.TELEGRAM]
+    runner._delivery_adapter_for = lambda source: runner.adapters[Platform.TELEGRAM]
     runner._is_user_authorized = lambda source: True
     runner._is_session_running = lambda _key: False
     runner._session_state = lambda _key: SimpleNamespace(

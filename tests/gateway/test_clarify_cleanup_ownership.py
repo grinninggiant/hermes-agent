@@ -1,19 +1,44 @@
 """Old callback/finalizer cleanup must not cancel an overlapping successor."""
 import asyncio
+from concurrent.futures import Future
 import threading
 from types import SimpleNamespace
 
 import pytest
 
+from gateway.config import Platform
+from gateway.session import SessionSource
 from gateway.platforms.base import SendResult
 from gateway.run_turn_runner import TurnRunner
 from gateway.turn_context import TurnContext
 from tools import clarify_gateway as cm
 
 
+@pytest.mark.parametrize("declined", [False, True])
+def test_late_failure_cancels_only_its_registration(declined):
+    from gateway.run_turn_runner_clarify_delivery import _LateFailureWatch
+
+    key = "overlapping-late-send"
+    old = cm.register("late-old", key, "Old?", None)
+    new = cm.register("late-new", key, "New?", None)
+    future = Future()
+    watch = _LateFailureWatch(future, clarify_id=old.clarify_id, clarify_mod=cm, fallback=None)
+    try:
+        future.set_result(SendResult(success=False,
+            raw_response={"code": "egress_declined"} if declined else None))
+        assert watch.undeliverable
+        assert old.event.is_set()
+        assert not new.event.is_set()
+        assert not cm.resolve_gateway_clarify(old.clarify_id, "late")
+        assert cm.resolve_gateway_clarify(new.clarify_id, "answer")
+    finally:
+        cm.clear_session(key)
+
+
 def _runner(loop, adapter, key):
     runner = TurnRunner(None, TurnContext(
         session_key=key, session_id="session", message="question",
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="chat"),
         _status_adapter=adapter, _status_chat_id="chat", _loop_for_step=loop,
     ))
     runner._native_image_run_message = lambda: "question"

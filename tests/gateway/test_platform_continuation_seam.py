@@ -76,7 +76,7 @@ def _event(*, internal=False):
 async def test_iteration_limit_is_classified_before_platform_delivery(monkeypatch, tmp_path):
     """An unfinished bounded turn must not escape as a terminal platform response."""
     from gateway.run import GatewayRunner
-    from tests.gateway.test_42039_duplicate_user_message import _bootstrap
+    from tests.gateway.test_duplicate_user_message import _bootstrap
 
     adapter = _ContinuationAdapter()
     runner: GatewayRunner = _bootstrap(monkeypatch, tmp_path)
@@ -164,7 +164,7 @@ async def test_internal_continuation_can_be_fenced_immediately_before_execution(
 async def test_native_goal_continuation_is_fenced_before_execution(monkeypatch, tmp_path):
     """A normal native goal continuation must honor the adapter execution fence."""
     from gateway.run import GatewayRunner
-    from tests.gateway.test_42039_duplicate_user_message import _bootstrap
+    from tests.gateway.test_duplicate_user_message import _bootstrap
 
     adapter = _ContinuationAdapter()
     adapter.execution_allowed = False
@@ -216,7 +216,7 @@ async def test_internal_route_rejected_when_session_mapping_changes_after_adapte
 ):
     """A runner-side key change is rejection, not successful intentional silence."""
     from gateway.run import GatewayRunner
-    from tests.gateway.test_42039_duplicate_user_message import _bootstrap
+    from tests.gateway.test_duplicate_user_message import _bootstrap
 
     adapter = _ContinuationAdapter()
     runner: GatewayRunner = _bootstrap(monkeypatch, tmp_path)
@@ -254,7 +254,7 @@ async def test_internal_route_rejected_when_strict_session_identity_changes_afte
 ):
     """A strict key whose current session changed must expose rejection to completion."""
     from gateway.run import GatewayRunner
-    from tests.gateway.test_42039_duplicate_user_message import _bootstrap
+    from tests.gateway.test_duplicate_user_message import _bootstrap
 
     adapter = _ContinuationAdapter()
     runner: GatewayRunner = _bootstrap(monkeypatch, tmp_path)
@@ -288,7 +288,7 @@ async def test_strict_session_identity_is_revalidated_after_awaited_preparation(
 ):
     """A reset while the last preparation await is blocked must prevent model execution."""
     from gateway.run import GatewayRunner
-    from tests.gateway.test_42039_duplicate_user_message import _bootstrap
+    from tests.gateway.test_duplicate_user_message import _bootstrap
 
     runner: GatewayRunner = _bootstrap(monkeypatch, tmp_path)
     event = _event(internal=True)
@@ -352,7 +352,7 @@ async def test_stale_generation_does_not_publish_result_or_invoke_delivery_polic
 ):
     """A completed obsolete run is not a turn eligible for platform delivery policy."""
     from gateway.run import GatewayRunner
-    from tests.gateway.test_42039_duplicate_user_message import _bootstrap
+    from tests.gateway.test_duplicate_user_message import _bootstrap
 
     adapter = _ContinuationAdapter()
     adapter.prepare_turn_delivery = AsyncMock(return_value="must not send")
@@ -386,7 +386,7 @@ async def test_queued_first_response_is_prepared_before_terminal_delivery():
         session_key=build_session_key(event.source), source=event.source,
         stream_consumer_holder=[None], event_message_id=event.message_id,
         inbound_message_id=event.message_id, _status_thread_metadata=None,
-        gateway_event=event, _run_still_current=lambda: True, run_generation=1,
+        mute_notification_reply=False, gateway_event=event, _run_still_current=lambda: True, run_generation=1,
     )
     result = {
         "final_response": "blocked\nMEDIA:https://example.invalid/private.png",
@@ -436,7 +436,7 @@ async def test_stale_queued_turn_has_no_terminal_egress(invalidation_point):
         session_key=build_session_key(event.source), source=event.source,
         stream_consumer_holder=[MagicMock()], event_message_id=event.message_id,
         inbound_message_id=event.message_id, _status_thread_metadata=None,
-        gateway_event=event, _run_still_current=lambda: current, run_generation=1,
+        mute_notification_reply=False, gateway_event=event, _run_still_current=lambda: current, run_generation=1,
         session_id="session-1",
     )
     result = {
@@ -468,7 +468,7 @@ async def test_stale_normal_turn_has_no_text_media_or_tts_egress(
 ):
     """A normal turn invalidated on either side of policy cannot reach any terminal rail."""
     from gateway.run import GatewayRunner
-    from tests.gateway.test_42039_duplicate_user_message import _bootstrap
+    from tests.gateway.test_duplicate_user_message import _bootstrap
 
     adapter = _ContinuationAdapter()
     runner: GatewayRunner = _bootstrap(monkeypatch, tmp_path)
@@ -524,7 +524,7 @@ async def test_stale_normal_turn_has_no_text_media_or_tts_egress(
 async def test_policy_runs_before_auto_tts_terminal_egress(monkeypatch, tmp_path):
     """Whole-file TTS cannot speak a response rejected by the delivery policy."""
     from gateway.run import GatewayRunner
-    from tests.gateway.test_42039_duplicate_user_message import _bootstrap
+    from tests.gateway.test_duplicate_user_message import _bootstrap
 
     adapter = _ContinuationAdapter()
     runner: GatewayRunner = _bootstrap(monkeypatch, tmp_path)
@@ -577,7 +577,7 @@ def test_response_streaming_capability_keeps_interim_commentary_available(monkey
 
     adapter = _ContinuationAdapter()
     runner = MagicMock()
-    runner._adapter_for_source.return_value = adapter
+    runner._delivery_adapter_for.return_value = adapter
     runner._build_stream_consumer_config.return_value = (MagicMock(), None)
     consumer = MagicMock()
     monkeypatch.setattr(

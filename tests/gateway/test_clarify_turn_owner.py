@@ -18,7 +18,8 @@ from tools import clarify_gateway
 
 
 @pytest.mark.parametrize("route", ["sequential", "invoke"])
-def test_owner_is_captured_before_bounded_hook_and_reaches_registry(monkeypatch, tmp_path, route):
+@pytest.mark.parametrize("batch", [False, True])
+def test_owner_is_captured_before_bounded_hook_and_reaches_registry(monkeypatch, tmp_path, route, batch):
     """A delayed old call must never borrow the new turn's identity or callback."""
     session_key = "owner-handoff"
     sent = []
@@ -72,6 +73,8 @@ def test_owner_is_captured_before_bounded_hook_and_reaches_registry(monkeypatch,
     monkeypatch.setattr(plugins, "invoke_hook", manager.invoke_hook)
     monkeypatch.setattr(plugins, "_resolve_hook_callback_timeout", lambda: 5)
     args = {"question": "Target?", "choices": ["yes"], "turn_owner": ["forged", "forged"]}
+    if batch:
+        args["questions"] = [{"qid": "target", "question": "Target?", "choices": ["yes"]}]
     try:
         if route == "sequential":
             ref = _ToolCallRef("clarify", args, "task", "call", [])
@@ -81,7 +84,11 @@ def test_owner_is_captured_before_bounded_hook_and_reaches_registry(monkeypatch,
             result = dispatch.execute(final_args)
         else:
             result = invoke_tool(agent, "clarify", args, "task", "call")
-        assert json.loads(result)["user_response"] == "yes"
+        payload = json.loads(result)
+        if batch:
+            assert payload["responses"][0]["user_response"] == "yes"
+        else:
+            assert payload["user_response"] == "yes"
         assert sent == [(("session-old", "turn-old"), metadata)]
         replacement_callback.assert_not_called()
         assert hook_threads and all(t != caller_thread for t in hook_threads)

@@ -46,7 +46,7 @@ async def test_delayed_marker_cannot_mark_replacement_session(tmp_path, consumer
         adapter = SimpleNamespace(
             _active_sessions={key: SimpleNamespace(_hermes_run_generation=3)},
         )
-        runner._adapter_for_source = lambda _source: adapter
+        runner._delivery_adapter_for = lambda _source: adapter
         runner._session_key_for_source = lambda _source: key
         runner._is_session_run_current = lambda *_args: True
         runner._async_session_store = async_store

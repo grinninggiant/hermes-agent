@@ -51,8 +51,7 @@ def test_gate_budget_second_save_remains_conditional(hermes_home):
             goals.GoalManager("cas-gate-budget").set("replacement goal")
         return saved
 
-    with patch.object(db, "set_meta_if_equals", side_effect=replace_after_first_cas), \
-         patch.object(goals, "workspace_fingerprint", return_value=""):
+    with patch.object(db, "set_meta_if_equals", side_effect=replace_after_first_cas):
         decision = manager.evaluate_after_turn("late response")
 
     assert decision["stale_owner"] is True

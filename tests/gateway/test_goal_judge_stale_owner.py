@@ -51,7 +51,7 @@ class _NoticeAndFifoCapture:
 def _runner(adapter, session_key):
     """A concrete GatewayRunner MRO with only transport lookup supplied by the test."""
     runner = object.__new__(GatewayRunner)
-    runner._adapter_for_source = lambda _source: adapter
+    runner._delivery_adapter_for = lambda _source: adapter
     runner._session_key_for_source = lambda _source: session_key
     runner.config = {}
     runner._sessions = {}
