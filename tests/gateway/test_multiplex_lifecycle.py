@@ -63,6 +63,22 @@ def test_cron_tick_homes_include_active_named_host(tmp_path, monkeypatch):
     assert cron_by_name["host"] == default_home / "profiles" / "host"
 
 
+def test_standalone_gateway_ticks_only_its_own_home(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    default_home = tmp_path / ".hermes"
+    for name in ("host", "worker"):
+        home = default_home / "profiles" / name
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text("gateway:\n  standalone: true\n")
+    host = default_home / "profiles" / "host"
+    monkeypatch.setenv("HERMES_HOME", str(host))
+
+    import gateway.run as gateway_run
+
+    assert gateway_run._cron_tick_profile_homes(GatewayConfig(multiplex_profiles=False)) == [
+        ("host", host)]
+
+
 class TestNamedProfileMultiplexerGuard:
     """_guard_named_profile_under_multiplexer is inert unless all conditions hold."""
 

@@ -75,6 +75,23 @@ def test_multi_profile_homes_passed_to_builtin(monkeypatch, _providers, tmp_path
     assert profile_homes() == homes
 
 
+def test_standalone_desktop_ticker_enumerates_only_its_own_home(monkeypatch, _providers, tmp_path):
+    _sp, builtin = _providers
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    default_home = tmp_path / ".hermes"
+    for name in ("host", "worker"):
+        home = default_home / "profiles" / name
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text("gateway:\n  standalone: true\n")
+    host = default_home / "profiles" / "host"
+    monkeypatch.setenv("HERMES_HOME", str(host))
+
+    ws._start_desktop_cron_ticker(threading.Event(), interval=7)
+
+    assert builtin.start_kwargs["profile_homes"]() == [
+        ("host", host)]
+
+
 @pytest.mark.parametrize("gateway_running", [True, False])
 def test_single_profile_ticks_only_without_gateway(monkeypatch, tmp_path, gateway_running):
     """Exercise Desktop startup through the real built-in scheduler loop."""

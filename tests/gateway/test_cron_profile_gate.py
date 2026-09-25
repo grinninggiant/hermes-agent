@@ -55,6 +55,11 @@ class TestCronProfileGate:
         monkeypatch.setattr(gateway_status, "resolve_gateway_liveness", _boom)
         assert gw_run._cron_profile_gate("b", tmp_path / "home-b") is False
 
+    def test_partial_probe_failure_does_not_claim_an_unknown_home(self, tmp_path, monkeypatch):
+        _liveness(monkeypatch, GatewayLiveness(
+            running=False, pid=None, source="none", probe_error=True))
+        assert gw_run._cron_profile_gate("b", tmp_path / "home-b") is False
+
 
 def test_gateway_passes_a_profile_gate_to_the_cron_ticker(tmp_path, monkeypatch):
     """Wiring: an unpassed gate gates nothing. Capture what the gateway hands the ticker."""

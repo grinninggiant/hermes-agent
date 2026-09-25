@@ -98,15 +98,18 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     start_kwargs: dict = {"interval": interval}
     if isinstance(provider, InProcessCronScheduler):
         try:
+            from hermes_constants import get_hermes_home
             from hermes_cli.profiles import (
-                _check_gateway_running, _served_by_running_multiplexer, profiles_to_serve)
+                _check_gateway_running, _served_by_running_multiplexer,
+                profile_is_standalone, profiles_to_serve)
 
-            # Same served set as the multiplexer: default + every live profile under profiles/.
+            # Multiplexed homes normally; standalone profiles tick only their own home.
             # The ticker re-enumerates this callable every cycle. Passing a
             # startup snapshot leaves deleted profiles in the scheduler until
             # restart, which both writes their removed stores and keeps stale
             # profiles alive in Desktop's background work.
-            profile_homes = lambda: list(profiles_to_serve(multiplex=True))
+            profile_homes = lambda: list(profiles_to_serve(
+                multiplex=not profile_is_standalone(get_hermes_home())))
             initial_profile_homes = profile_homes()
             if initial_profile_homes:
                 # Even one profile needs the per-tick gateway gate; otherwise
