@@ -659,6 +659,20 @@ def test_arch_guard_allows_emulated_x64_on_win32_arm64(monkeypatch, tmp_path):
     assert problems == []
 
 
+@pytest.mark.parametrize("target,sign", [("darwin-arm64", True), ("linux-arm64-bionic", False), ("win32-arm64", False)])
+def test_python_stage_only_signs_darwin_targets_on_macos(monkeypatch, tmp_path, target, sign):
+    from pm.registry import get_package
+    from pm.store import Store
+
+    monkeypatch.setattr("pm.packages.sys.platform", "darwin")
+    signed = []
+    monkeypatch.setattr("hermes_cli.macos_signing.sign_managed_python", signed.append)
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    get_package("python").stage(Store(tmp_path / "store"), staged, "3.14.7", target)
+    assert signed == ([staged / "bin/python3"] if sign else [])
+
+
 def test_python_stage_drops_unloadable_x64_vc_runtime_on_arm64(monkeypatch, tmp_path):
     from pm.registry import get_package
 
