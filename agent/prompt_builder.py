@@ -1377,13 +1377,7 @@ def _render_skills_index(
             if name not in seen:
                 seen.add(name)
                 index_lines.append(f"    - {name}: {desc}" if desc else f"    - {name}")
-    from agent.oneshot_footprint import ONESHOT_SKILLS_LOAD_GUIDANCE, is_single_query_session
-    if is_single_query_session():
-        return (
-            ONESHOT_SKILLS_LOAD_GUIDANCE
-            + "\n<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>"
-            + hidden_note
-        )
+    from agent.oneshot_footprint import ONESHOT_SKILLS_AUTHORING_GUIDANCE, is_single_query_session
     return (
         "## Skills\n"
         + (package.skills_lead.format(basic_tools=(
@@ -1395,10 +1389,12 @@ def _render_skills_index(
         "for the next action. Follow applicable domain instructions and required governance; this "
         "selection rule does not relax security, approval, credential, Stop, or human-owned completion boundaries.\n"
         ))
-        + "If a skill has issues, fix it with skill_manage(action='patch').\n"
+        + (ONESHOT_SKILLS_AUTHORING_GUIDANCE if is_single_query_session() else (
+        "If a skill has issues, fix it with skill_manage(action='patch').\n"
         "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
         "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
-        "\n"
+        ))
+        + "\n"
         "<available_skills>\n"
         + "\n".join(index_lines) + "\n"
         "</available_skills>\n\n"
