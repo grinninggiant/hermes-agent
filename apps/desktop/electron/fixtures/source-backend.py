@@ -34,7 +34,7 @@ def main() -> None:
     assert uv, "real uv must be prepared on PATH"
     sites = [p for p in sys.path if p.endswith("site-packages")]
     assert sites, "run with the prepared Hermes Python dependency environment"
-    wheels = temp / "wheels"
+    wheels = root / "wheels"
     wheels.mkdir()
     dist = "desktop_backend_deps-1.dist-info"
     entries = {

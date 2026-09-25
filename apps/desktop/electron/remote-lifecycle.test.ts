@@ -111,7 +111,7 @@ function fakeSsh(rules: any[] = []) {
         return !(mutexWrapped && matcher instanceof RegExp && /python3 -c/.test(matcher.source))
       })
 
-      if ((cmd.includes('os.kill(pid') && !cmd.includes('pidfd_open')) || cmd.includes('printf TERMINATED')) {
+      if ((cmd.includes('os.kill(pid') && !cmd.includes('pidfd_open') && !cmd.includes('print("OWNED" if ok else "FOREIGN")')) || cmd.includes('printf TERMINATED')) {
         return 'TERMINATED'
       }
 
@@ -713,6 +713,32 @@ test.skipIf(process.platform === 'win32')(
         ),
         false
       )
+
+      if (process.platform === 'darwin') {
+        const commands: string[] = []
+        const failedProbeSsh: Pick<SshConnection, 'exec'> = {
+          exec: async (command: string): Promise<string> => {
+            commands.push(command)
+            if (command.includes('if libc.sysctl(mib,3,None,ctypes.byref(size),None,0):')) {
+              const failed = command.replace(
+                'if libc.sysctl(mib,3,None,ctypes.byref(size),None,0):',
+                'if (_ for _ in ()).throw(OSError()):'
+              )
+              return (await exec(failed, { shell, env })).stdout
+            }
+            return ''
+          }
+        }
+        await assert.rejects(
+          cleanupStale(
+            failedProbeSsh,
+            OWNERSHIP_ID,
+            ownedLock({ pid: child.pid, hermesPath: launcher, hermesHome: '/unrelated/hermes-home', profile: 'ops' })
+          ),
+          (error: any) => error.kind === 'transient-transport-error'
+        )
+        assert.ok(!commands.some(command => /\bkill\s+(?:-9\s+)?\d+|rm -f/.test(command)))
+      }
 
       const misplacedIsolated = spawnInstaller(['--profile', 'ops', '--isolated', 'serve', ...backendFlags])
 

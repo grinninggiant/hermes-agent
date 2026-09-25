@@ -674,12 +674,41 @@ async function pidIsOurDashboard(
     ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
     ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
     'except OSError:\n' +
-    ' try:\n' +
-    '  line=subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip()\n' +
-    ' except subprocess.CalledProcessError:\n' +
-    '  # pid already gone — a dead process is FOREIGN, not a transport error\n' +
-    '  print("FOREIGN");sys.exit(0)\n' +
-    ' args=shlex.split(line)\n' +
+    ' if sys.platform=="darwin":\n' +
+    '  # ps loses argv boundaries for paths containing spaces; use the kernel record.\n' +
+    '  import ctypes\n' +
+    '  try:\n' +
+    '   libc=ctypes.CDLL("/usr/lib/libSystem.B.dylib",use_errno=True)\n' +
+    '   libc.sysctl.argtypes=[ctypes.POINTER(ctypes.c_int),ctypes.c_uint,ctypes.c_void_p,ctypes.POINTER(ctypes.c_size_t),ctypes.c_void_p,ctypes.c_size_t]\n' +
+    '   mib=(ctypes.c_int*3)(1,49,pid) # CTL_KERN, KERN_PROCARGS2\n' +
+    '   size=ctypes.c_size_t()\n' +
+    '   if libc.sysctl(mib,3,None,ctypes.byref(size),None,0):raise OSError("argv size unavailable")\n' +
+    '   if not 5<=size.value<=4194304:raise ValueError("invalid argv size")\n' +
+    '   buf=ctypes.create_string_buffer(size.value)\n' +
+    '   if libc.sysctl(mib,3,buf,ctypes.byref(size),None,0):raise OSError("argv unavailable")\n' +
+    '   raw=buf.raw[:size.value]\n' +
+    '   argc=int.from_bytes(raw[:4],sys.byteorder,signed=True)\n' +
+    '   start=raw.find(b"\\0",4)+1\n' +
+    '   if not 0<argc<=4096 or start<=4:raise ValueError("invalid argv header")\n' +
+    '   while start<len(raw) and raw[start]==0:start+=1\n' +
+    '   args=[]\n' +
+    '   for _ in range(argc):\n' +
+    '    end=raw.find(b"\\0",start)\n' +
+    '    if end<=start:raise ValueError("truncated argv")\n' +
+    '    args.append(raw[start:end].decode("utf-8","surrogateescape"))\n' +
+    '    start=end+1\n' +
+    '  except (OSError,ValueError,UnicodeError,IndexError):\n' +
+    '   try:os.kill(pid,0)\n' +
+    '   except ProcessLookupError:print("FOREIGN");sys.exit(0)\n' +
+    '   except OSError:pass\n' +
+    '   sys.exit(2)\n' +
+    ' else:\n' +
+    '  try:\n' +
+    '   line=subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip()\n' +
+    '  except subprocess.CalledProcessError:\n' +
+    '   # pid already gone — a dead process is FOREIGN, not a transport error\n' +
+    '   print("FOREIGN");sys.exit(0)\n' +
+    '  args=shlex.split(line)\n' +
     'ok=False\n' +
     'try:\n' +
     ' serve=args.index("serve")\n' +
