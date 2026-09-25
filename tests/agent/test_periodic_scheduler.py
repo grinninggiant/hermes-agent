@@ -22,8 +22,9 @@ def test_two_intervals_fire_proportionally_and_cancel_stops_one():
     h_fast = sched.schedule(lambda: fast.append(time.monotonic()), 0.01)
     h_slow = sched.schedule(lambda: slow.append(time.monotonic()), 0.05)
 
-    assert _wait_until(lambda: len(slow) >= 3)
-    assert len(fast) > len(slow)  # 5x interval ratio -> clearly more fast ticks
+    assert _wait_until(lambda: len(slow) >= 3 and len(fast) > len(slow)), (
+        "5x faster callback did not outpace slow callback"
+    )
     assert sched._thread is not None and sched._thread.is_alive()
 
     h_fast.cancel(wait=1.0)
