@@ -1725,8 +1725,8 @@ def _cron_profile_gate(name: str, home: "Path") -> bool:
             profile_dir=Path(home), use_cache=False,
             pid_probe=lambda path: get_running_pid(path, cleanup_stale=False))
     except Exception as exc:
-        logger.debug("Cron profile gate probe failed for %s (ticking it): %s", name, exc)
-        return True
+        logger.warning("Cron profile gate probe failed for %s (skipping this cycle): %s", name, exc)
+        return False
     return not (liveness.running and liveness.pid is not None and liveness.pid != os.getpid())
 
 

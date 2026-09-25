@@ -45,15 +45,15 @@ class TestCronProfileGate:
         _liveness(monkeypatch, GatewayLiveness(running=False, pid=None, source="none"))
         assert gw_run._cron_profile_gate("b", tmp_path / "home-b") is True
 
-    def test_probe_failure_ticks_rather_than_silently_dropping_cron(self, tmp_path, monkeypatch):
-        """A raising probe must not be read as "another gateway owns it"."""
+    def test_probe_failure_does_not_claim_an_unknown_home(self, tmp_path, monkeypatch):
+        """Uncertain ownership must not touch another profile's cron store."""
         from gateway import status as gateway_status
 
         def _boom(**_kw):
             raise RuntimeError("probe exploded")
 
         monkeypatch.setattr(gateway_status, "resolve_gateway_liveness", _boom)
-        assert gw_run._cron_profile_gate("b", tmp_path / "home-b") is True
+        assert gw_run._cron_profile_gate("b", tmp_path / "home-b") is False
 
 
 def test_gateway_passes_a_profile_gate_to_the_cron_ticker(tmp_path, monkeypatch):
