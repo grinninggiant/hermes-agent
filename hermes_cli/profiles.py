@@ -1572,12 +1572,20 @@ def _profile_bound_backend_pids(canon: str, profile_dir: Path) -> list[int]:
             if not ({tok.lower() for tok in argv} & _BACKEND_TOKENS):
                 continue
 
-            # Bound to THIS profile by selector flag, or by HERMES_HOME pointing at its dir.
-            bound = any(normalize_profile_name(sel) == canon for sel in _argv_profile_selectors(argv))
-            if not bound:
-                with contextlib.suppress(Exception):  # environ() can raise AccessDenied even same-user
-                    env_home = (proc.environ() or {}).get("HERMES_HOME", "")
-                    bound = bool(env_home) and Path(env_home).resolve() == resolved_dir
+            # A selector wins over inherited HERMES_HOME at startup, but a live
+            # process reporting a different home is not proven to own this profile.
+            selectors = tuple(_argv_profile_selectors(argv))
+            if selectors and not all(normalize_profile_name(sel) == canon for sel in selectors):
+                continue
+            bound = bool(selectors)
+            try:
+                env_home = (proc.environ() or {}).get("HERMES_HOME", "")
+            except Exception:  # Cannot prove the selector agrees with the live home.
+                continue
+            if env_home:
+                if Path(env_home).resolve() != resolved_dir:
+                    continue
+                bound = True
             if bound:
                 pids.append(pid)
         except Exception:

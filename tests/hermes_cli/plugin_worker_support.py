@@ -178,7 +178,8 @@ def plugin_world(tmp_path, monkeypatch, isolated_python):
     monkeypatch.setattr(client, "runtime_command", lambda worker, **kwargs:
                         worker_command(worker, uv, sys.executable, runtime_python=world.runtime_python))
     assert not client.is_runtime(), "fixture must exercise the client/worker boundary"
-    wheels = tmp_path / "wheels"
+    world.core.mkdir()
+    wheels = world.core / "wheels"
     wheels.mkdir()
     _wheel(wheels, "plugin_core_dep")
     _wheel(wheels, "plugin_proof_other")
@@ -186,7 +187,6 @@ def plugin_world(tmp_path, monkeypatch, isolated_python):
         _wheel(wheels, "plugin_proof_dep", pin)
     world.home.mkdir()
     (world.home / "config.yaml").write_text("plugins:\n  enabled: []\n  disabled: []\n", encoding="utf-8")
-    world.core.mkdir()
     (world.core / "pyproject.toml").write_text(
         '[project]\nname="plugin-proof-core"\nversion="1"\nrequires-python=">=3.11"\n'
         'dependencies=["plugin-core-dep==1.0"]\n[tool.uv]\npackage=false\nno-index=true\n'

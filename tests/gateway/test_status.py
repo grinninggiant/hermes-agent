@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1289,6 +1290,7 @@ class TestReadProcessCmdlinePsFallback:
 
     def test_ps_fallback_when_proc_unavailable(self, monkeypatch):
         monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))
+        monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(Process=lambda pid: None))
         monkeypatch.setattr(
             status.subprocess, "run",
             lambda args, **kwargs: SimpleNamespace(returncode=0, stdout="/usr/libexec/bluetoothuserd\n"),

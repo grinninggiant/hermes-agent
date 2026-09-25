@@ -500,6 +500,7 @@ class TestDeleteProfile:
         set_active_profile("coder")
 
         with patch("hermes_cli.profiles._cleanup_gateway_service"), \
+             patch("hermes_cli.profiles._stop_profile_backends"), \
              patch("hermes_cli.profiles.time.sleep"), \
              patch("hermes_cli.profiles.shutil.rmtree", side_effect=PermissionError("locked")):
             with pytest.raises(RuntimeError, match="Could not remove profile directory"):
@@ -608,9 +609,10 @@ class TestDeleteProfile:
         profile_dir = get_profile_dir("coder")
 
         class FakeProc:
-            def __init__(self, pid, cmdline, username="me"):
+            def __init__(self, pid, cmdline, username="me", env_home=None):
                 self.pid = pid
                 self.info = {"pid": pid, "name": "python", "username": username, "cmdline": cmdline}
+                self.env_home = env_home
 
             def parent(self):
                 return None
@@ -619,7 +621,9 @@ class TestDeleteProfile:
                 return "me"
 
             def environ(self):
-                return {}
+                if isinstance(self.env_home, Exception):
+                    raise self.env_home
+                return {"HERMES_HOME": str(self.env_home)} if self.env_home else {}
 
         self_pid = os.getpid()
         procs = [
@@ -629,6 +633,15 @@ class TestDeleteProfile:
             FakeProc(102, ["python", "-m", "hermes_cli.main", "--profile", "coder", "chat"]),
             # Backend for a different profile → skipped.
             FakeProc(103, ["python", "-m", "hermes_cli.main", "--profile", "other", "serve"]),
+            # Conflicting selectors/HOME do not authorize a signal to either profile.
+            FakeProc(104, ["python", "-m", "hermes_cli.main", "--profile", "coder", "serve"],
+                     env_home=profile_dir.parent / "other"),
+            FakeProc(105, ["python", "-m", "hermes_cli.main", "--profile", "other", "serve"],
+                     env_home=profile_dir),
+            FakeProc(106, ["python", "-m", "hermes_cli.main", "--profile", "coder", "serve"],
+                     env_home=PermissionError("environ denied")),
+            FakeProc(107, ["python", "-m", "hermes_cli.main", "--profile", "coder", "serve"],
+                     env_home=profile_dir),
             # This very process → skipped even if it matched.
             FakeProc(self_pid, ["python", "-m", "hermes_cli.main", "--profile", "coder", "serve"]),
         ]
@@ -643,7 +656,7 @@ class TestDeleteProfile:
         monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
         pids = profiles._profile_bound_backend_pids("coder", profile_dir)
-        assert pids == [101]
+        assert pids == [101, 107]
 
     def test_backend_scan_matches_shebang_exec_of_hermes_shim(self, profile_env, monkeypatch):
         """A `hermes` console-script shim spawned directly (e.g. Electron's
